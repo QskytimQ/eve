@@ -11,17 +11,6 @@ get_git_tag() {
   echo ${EVE_HASH:-$(git tag -l --points-at HEAD | grep '[0-9]*\.[0-9]*\.[0-9]*' | head -1)}
 }
 
-eve_version() {
-  local vers="`get_git_tag`"
-
-  if [ -z "$vers" ] ; then
-    vers="${EVE_SNAPSHOT_VERSION:-0.0.0}-$(git rev-parse --abbrev-ref HEAD | tr / _)-$(git describe --match v --abbrev=8 --always --dirty)-$(date -u +"%Y-%m-%d.%H.%M")"
-    vers=`echo ${vers} | sed -e 's#-master##'`
-  fi
-
-  echo $vers
-}
-
 linuxkit_tag() {
     echo "$(linuxkit pkg show-tag ${EVE_HASH:+--hash $EVE_HASH} "$EVE/$1")$ARCH"
 }
@@ -63,9 +52,9 @@ synthetic_tag() {
 resolve_tags() {
 sed -e '/-.*linuxkit\/.*:/s# *$#'${ARCH}# \
     -e '/image:.*linuxkit\/.*:/s# *$#'${ARCH}# \
-    -e "s#EVE_VERSION#$EVE_VERSION#" \
     -e "s#CURDIR#$(pwd)#" \
     -e "s#ACRN_KERNEL_TAG#$ACRN_KERNEL_TAG#" \
+    -e "s#NEW_KERNEL_TAG#$NEW_KERNEL_TAG#" \
     -e "s#KERNEL_TAG#$KERNEL_TAG#" \
     -e "s#FW_TAG#$FW_TAG#" \
     -e "s#XENTOOLS_TAG#$XENTOOLS_TAG#" \
@@ -89,9 +78,10 @@ sed -e '/-.*linuxkit\/.*:/s# *$#'${ARCH}# \
     -e "s#GPTTOOLS_TAG#$GPTTOOLS_TAG#" \
     -e "s#WATCHDOG_TAG#$WATCHDOG_TAG#" \
     -e "s#MKRAW_TAG#$MKRAW_TAG#" \
+    -e "s#MKISO_TAG#$MKISO_TAG#" \
+    -e "s#MKCONF_TAG#$MKCONF_TAG#" \
     -e "s#DEBUG_TAG#$DEBUG_TAG#" \
     -e "s#LISP_TAG#$LISP_TAG#" \
-    -e "s#FSCRYPT_TAG#${FSCRYPT_TAG}#" \
     -e "s#VTPM_TAG#${VTPM_TAG}#" \
     -e "s#UEFI_TAG#${UEFI_TAG}#" \
     -e "s#EVE_TAG#${EVE_TAG}#" \
@@ -111,9 +101,8 @@ else
   ARCH="-${DOCKER_ARCH_TAG}"
 fi
 
-EVE_VERSION=${EVE_VERSION:-`eve_version`$ARCH}
-
 KERNEL_TAG=$(linuxkit_tag pkg/kernel)
+NEW_KERNEL_TAG=$(linuxkit_tag pkg/new-kernel)
 ACRN_KERNEL_TAG=$(linuxkit_tag pkg/acrn-kernel)
 FW_TAG=$(linuxkit_tag pkg/fw)
 XENTOOLS_TAG=$(linuxkit_tag pkg/xen-tools)
@@ -136,8 +125,9 @@ STORAGE_INIT_TAG=$(linuxkit_tag pkg/storage-init)
 GPTTOOLS_TAG=$(linuxkit_tag pkg/gpt-tools)
 WATCHDOG_TAG=$(linuxkit_tag pkg/watchdog)
 MKRAW_TAG=$(linuxkit_tag pkg/mkimage-raw-efi)
+MKISO_TAG=$(linuxkit_tag pkg/mkimage-iso-efi)
+MKCONF_TAG=$(linuxkit_tag pkg/mkconf)
 DEBUG_TAG=$(linuxkit_tag pkg/debug)
-FSCRYPT_TAG=$(linuxkit_tag pkg/fscrypt)
 VTPM_TAG=$(linuxkit_tag pkg/vtpm)
 UEFI_TAG=$(linuxkit_tag pkg/uefi)
 

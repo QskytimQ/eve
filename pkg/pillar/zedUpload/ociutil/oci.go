@@ -3,17 +3,21 @@ package ociutil
 import (
 	"bytes"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path"
+	"strings"
+
+	"sync/atomic"
 
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
-	"github.com/google/go-containerregistry/pkg/v1"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/google/go-containerregistry/pkg/v1/tarball"
 	log "github.com/sirupsen/logrus"
-	"sync/atomic"
 )
 
 const (
@@ -30,25 +34,6 @@ type UpdateStats struct {
 
 // NotifChan channel for sending status updates
 type NotifChan chan UpdateStats
-
-// CustomWriter is a writer which will send the download progress
-type CustomWriter struct {
-	fp        *os.File
-	upSize    UpdateStats
-	prgNotify NotifChan
-}
-
-func (r *CustomWriter) Write(p []byte) (int, error) {
-	n, err := r.fp.Write(p)
-	if err != nil {
-		return n, err
-	}
-	atomic.AddInt64(&r.upSize.Asize, int64(n))
-
-	sendStats(r.prgNotify, r.upSize)
-
-	return n, err
-}
 
 // Tags return all known tags for a given repository on a given registry.
 // Optionally, can use authentication of username and apiKey as provided, else defaults
@@ -95,7 +80,164 @@ func Manifest(registry, repo, username, apiKey string, client *http.Client, prgc
 	return manifestDirect, manifestResolved, size, err
 }
 
-// Pull downloads the a repo from a registry and saves it as a tar file at the provided location.
+// PullBlob downloads a blob from a registry and save it as a file as-is.
+func PullBlob(registry, repo, hash, localFile, username, apiKey string, maxsize int64, client *http.Client, prgchan NotifChan) (int64, error) {
+	log.Infof("PullBlob(%s, %s, %s) to %s", registry, repo, hash, localFile)
+
+	var (
+		w        io.Writer
+		r        io.Reader
+		stats    UpdateStats
+		size     int64
+		finalErr error
+	)
+
+	// send out the maximum size as we understand it
+	stats.Size = maxsize
+	sendStats(prgchan, stats)
+
+	opts := options(username, apiKey, client)
+
+	// The OCI distribution spec only uses /blobs/ endpoint for layers or config, not index or manifest.
+	// I have no idea why you cannot get a manifest or index from the /blobs endpoint, but so be it.
+	image := fmt.Sprintf("%s/%s", registry, repo)
+	ref, err := name.ParseReference(image)
+	if err != nil {
+		return 0, fmt.Errorf("parsing reference %q: %v", image, err)
+	}
+
+	// If hash is not empty:
+	// if ref is of type Tag then add hash to the image
+	// if ref is of type Digest, check if the given hash and the hash in reference are same
+	if hash != "" {
+		hash = checkAndCorrectHash(hash)
+		if _, ok := ref.(name.Tag); ok {
+			log.Infof("PullBlob: Adding hash %s to image %s", hash, image)
+			image = fmt.Sprintf("%s@%s", image, hash)
+			ref, err = name.ParseReference(image)
+			if err != nil {
+				return 0, fmt.Errorf("parsing reference %q: %v", image, err)
+			}
+		} else {
+			d, ok := ref.(name.Digest)
+			if !ok {
+				return 0, fmt.Errorf("ref %s wasn't a tag or digest", image)
+			}
+			if checkAndCorrectHash(d.DigestStr()) != hash {
+				return 0, fmt.Errorf("PullBlob: given hash %s is different from the hash in reference %s",
+					hash, checkAndCorrectHash(d.DigestStr()))
+			}
+		}
+	}
+
+	// if we have only a tag, we know it is a manifest
+	if _, ok := ref.(name.Tag); ok {
+		log.Infof("PullBlob: requested manifest or had tag without hash, so just pulling root for %s", image)
+		r, err = ociGetManifest(ref, opts)
+		if err != nil {
+			return 0, err
+		}
+	} else {
+		// we had a hash, so get the actual layer, but fall back to manifest
+		d, ok := ref.(name.Digest)
+		if !ok {
+			return 0, fmt.Errorf("ref %s wasn't a tag or digest", image)
+		}
+		log.Infof("PullBlob: had hash, so pulling blob for %s", image)
+		layer, err := remote.Layer(d, opts...)
+		if err != nil {
+			return 0, fmt.Errorf("could not pull layer %s: %v", ref.String(), err)
+		}
+		// write the layer out to the file
+		lr, err := layer.Compressed()
+		if err != nil {
+			// anything other than a 404 should return
+			terr, ok := err.(*transport.Error)
+			if !ok || terr.StatusCode != 404 {
+				return 0, fmt.Errorf("could not get layer reader %s: %v", ref.String(), err)
+			}
+			// a 404 should try a manifest
+			r, err = ociGetManifest(ref, opts)
+			if err != nil {
+				return 0, fmt.Errorf("could not retrieve as blob or manifest %s: %v", ref.String(), err)
+			}
+		} else {
+			defer lr.Close()
+			r = lr
+		}
+	}
+
+	if localFile != "" {
+		f, err := os.Create(localFile)
+		if err != nil {
+			return 0, fmt.Errorf("could not open local file %s for writing from %s: %v", localFile, ref.String(), err)
+		}
+		defer f.Close()
+		w = f
+	} else {
+		w = os.Stdout
+	}
+
+	// get updates on downloads, convert and pass them to sendStats
+	c := make(chan Update, 200)
+	defer close(c)
+
+	// copy from the readstream over the network to the writestream to the local file
+	// we do this in a goroutine so we can catch the updates
+	pw := &ProgressWriter{
+		w:       w,
+		updates: c,
+		size:    maxsize,
+	}
+
+	go func() {
+		// copy all of the data
+		size, err := io.Copy(pw, r)
+		if err != nil && err != io.EOF {
+			log.Errorf("could not write to local file %s from %s: %v", localFile, ref.String(), err)
+		}
+		if err == nil {
+			err = io.EOF
+		}
+		c <- Update{
+			Total:    pw.size,
+			Complete: size,
+			Error:    err,
+		}
+	}()
+
+	for update := range c {
+		atomic.StoreInt64(&stats.Asize, update.Complete)
+		atomic.StoreInt64(&stats.Size, update.Total)
+		sendStats(prgchan, stats)
+		size = update.Complete
+		// any error means to stop
+		if update.Error != nil {
+			// EOF means we are at the end cleanly
+			if update.Error == io.EOF {
+				log.Infof("PullBlob(%s): download complete to %s size %d", image, localFile, size)
+				finalErr = nil
+			} else {
+				log.Errorf("PullBlob(%s): error saving to %s: %v", image, localFile, update.Error)
+				finalErr = update.Error
+			}
+			break
+		}
+	}
+
+	return size, finalErr
+}
+
+// ociGetManifest get an OCI manifest
+func ociGetManifest(ref name.Reference, opts []remote.Option) (io.Reader, error) {
+	desc, err := remote.Get(ref, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("error getting manifest: %v", err)
+	}
+	return bytes.NewReader(desc.Manifest), nil
+}
+
+// Pull downloads an entire image from a registry and saves it as a tar file at the provided location.
 // Optionally, can use authentication of username and apiKey as provided, else defaults
 // to the local user config. Also can use a given http client, else uses the default.
 // Returns the manifest of the repo passed to it, the manifest of the resolved image,
@@ -136,23 +278,50 @@ func Pull(registry, repo, localFile, username, apiKey string, client *http.Clien
 	if err != nil {
 		return manifestDirect, manifestResolved, size, err
 	}
-
-	cWriter := &CustomWriter{
-		fp:        w,
-		upSize:    stats,
-		prgNotify: prgchan,
-	}
 	defer w.Close()
+
+	tag, ok := ref.(name.Tag)
+	if !ok {
+		d, ok := ref.(name.Digest)
+		if !ok {
+			err := fmt.Errorf("Image name %s doesn't have a tag or digest", ref)
+			return manifestDirect, manifestResolved, size, err
+		}
+		parts := strings.Split(d.DigestStr(), ":")
+		if len(parts) != 2 {
+			err := fmt.Errorf("Image name %s is malformed, expected: <name>@sha256:<hash>", d.String())
+			return manifestDirect, manifestResolved, size, err
+		}
+		digestTag := fmt.Sprintf("dummyTag-%s", parts[1])
+		tag = d.Repository.Tag(digestTag)
+	}
+
+	// get updates on downloads, convert and pass them to sendStats
+	c := make(chan v1.Update, 200)
+	defer close(c)
 
 	// create a local file to write the output
 	// this uses the v1/tarball to write it, which is fully compatible with docker save.
 	// However, it is missing the "repositories" file, so we add it.
 	// Eventially, we may want to move to an entire cache of the registry in the
 	// OCI layout format.
-	err = tarball.Write(ref, img, cWriter)
-	if err != nil {
-		return manifestDirect, manifestResolved, size, fmt.Errorf("error saving to %s: %v", localFile, err)
+	go func() {
+		// we do not need to catch the return error, because tarball.WithProgress sends error updates on channels
+		_ = tarball.Write(tag, img, w, tarball.WithProgress(c))
+	}()
+
+	for update := range c {
+		atomic.StoreInt64(&stats.Asize, update.Complete)
+		sendStats(prgchan, stats)
+		// EOF means we are at the end
+		if update.Error != nil && update.Error == io.EOF {
+			break
+		}
+		if update.Error != nil {
+			return manifestDirect, manifestResolved, size, fmt.Errorf("error saving to %s: %v", localFile, update.Error)
+		}
 	}
+
 	return manifestDirect, manifestResolved, size, nil
 }
 
@@ -206,4 +375,9 @@ func DockerHashFromManifest(imageManifest []byte) (string, error) {
 		return "", fmt.Errorf("no layers found")
 	}
 	return layers[len(layers)-1].Digest.Hex, nil
+}
+
+//checkAndCorrectHash prepends algo "sha256:" if not already present.
+func checkAndCorrectHash(hash string) string {
+	return fmt.Sprintf("sha256:%s", strings.TrimPrefix(hash, "sha256:"))
 }

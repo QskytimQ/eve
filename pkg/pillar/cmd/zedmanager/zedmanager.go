@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2018 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// Get AppInstanceConfig from zedagent, drive config to Downloader, Verifier,
+// Get AppInstanceConfig from zedagent, drive config to VolumeMgr,
 // IdentityMgr, and Zedrouter. Collect status from those services and make
 // the combined AppInstanceStatus available to zedagent.
 
@@ -11,7 +11,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/google/go-cmp/cmp"
@@ -30,39 +29,24 @@ const (
 	warningTime = 40 * time.Second
 )
 
-// Set from Makefile
+// Version can be set from Makefile
 var Version = "No version specified"
 
 // State used by handlers
 type zedmanagerContext struct {
-	configRestarted         bool
-	verifierRestarted       bool
-	rwImageAvailable        bool
-	subAppInstanceConfig    pubsub.Subscription
-	pubAppInstanceStatus    pubsub.Publication
-	subDeviceNetworkStatus  pubsub.Subscription
-	pubAppNetworkConfig     pubsub.Publication
-	subAppNetworkStatus     pubsub.Subscription
-	pubDomainConfig         pubsub.Publication
-	subDomainStatus         pubsub.Subscription
-	subImageStatus          pubsub.Subscription
-	pubEIDConfig            pubsub.Publication
-	subEIDStatus            pubsub.Subscription
-	subCertObjStatus        pubsub.Subscription
-	pubAppImgDownloadConfig pubsub.Publication
-	subAppImgDownloadStatus pubsub.Subscription
-	pubAppImgVerifierConfig pubsub.Publication
-	subAppImgVerifierStatus pubsub.Subscription
-	pubAppImgPersistConfig  pubsub.Publication
-	subAppImgPersistStatus  pubsub.Subscription
-	subGlobalConfig         pubsub.Subscription
-	globalConfig            *types.GlobalConfig
-	pubUuidToNum            pubsub.Publication
-	pubAppAndImageToHash    pubsub.Publication
-	GCInitialized           bool
+	subAppInstanceConfig pubsub.Subscription
+	pubAppInstanceStatus pubsub.Publication
+	pubVolumeRefConfig   pubsub.Publication
+	subVolumeRefStatus   pubsub.Subscription
+	pubAppNetworkConfig  pubsub.Publication
+	subAppNetworkStatus  pubsub.Subscription
+	pubDomainConfig      pubsub.Publication
+	subDomainStatus      pubsub.Subscription
+	subGlobalConfig      pubsub.Subscription
+	globalConfig         *types.ConfigItemValueMap
+	pubUuidToNum         pubsub.Publication
+	GCInitialized        bool
 }
-
-var deviceNetworkStatus types.DeviceNetworkStatus
 
 var debug = false
 var debugOverride bool // From command line arg
@@ -70,7 +54,6 @@ var debugOverride bool // From command line arg
 func Run(ps *pubsub.PubSub) {
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
@@ -79,20 +62,16 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	curpart := *curpartPtr
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
 		return
 	}
-	err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
+	agentlog.Init(agentName)
 
 	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
 		log.Fatal(err)
 	}
-	log.Infof("Starting %s\n", agentName)
+	log.Infof("Starting %s", agentName)
 
 	// Run a periodic timer so we always update StillRunning
 	stillRunning := time.NewTicker(25 * time.Second)
@@ -100,7 +79,7 @@ func Run(ps *pubsub.PubSub) {
 
 	// Any state needed by handler functions
 	ctx := zedmanagerContext{
-		globalConfig: &types.GlobalConfigDefaults,
+		globalConfig: types.DefaultConfigItemValueMap(),
 	}
 	// Create publish before subscribing and activating subscriptions
 	pubAppInstanceStatus, err := ps.NewPublication(pubsub.PublicationOptions{
@@ -112,6 +91,16 @@ func Run(ps *pubsub.PubSub) {
 	}
 	ctx.pubAppInstanceStatus = pubAppInstanceStatus
 	pubAppInstanceStatus.ClearRestarted()
+
+	pubVolumeRefConfig, err := ps.NewPublication(pubsub.PublicationOptions{
+		AgentName:  agentName,
+		AgentScope: types.AppImgObj,
+		TopicType:  types.VolumeRefConfig{},
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx.pubVolumeRefConfig = pubVolumeRefConfig
 
 	pubAppNetworkConfig, err := ps.NewPublication(pubsub.PublicationOptions{
 		AgentName: agentName,
@@ -133,49 +122,6 @@ func Run(ps *pubsub.PubSub) {
 	ctx.pubDomainConfig = pubDomainConfig
 	pubDomainConfig.ClearRestarted()
 
-	pubEIDConfig, err := ps.NewPublication(pubsub.PublicationOptions{
-		AgentName: agentName,
-		TopicType: types.EIDConfig{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.pubEIDConfig = pubEIDConfig
-	pubEIDConfig.ClearRestarted()
-
-	pubAppImgDownloadConfig, err := ps.NewPublication(pubsub.PublicationOptions{
-		AgentName:  agentName,
-		AgentScope: types.AppImgObj,
-		TopicType:  types.DownloaderConfig{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	pubAppImgDownloadConfig.ClearRestarted()
-	ctx.pubAppImgDownloadConfig = pubAppImgDownloadConfig
-
-	pubAppImgVerifierConfig, err := ps.NewPublication(pubsub.PublicationOptions{
-		AgentName:  agentName,
-		AgentScope: types.AppImgObj,
-		TopicType:  types.VerifyImageConfig{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	pubAppImgVerifierConfig.ClearRestarted()
-	ctx.pubAppImgVerifierConfig = pubAppImgVerifierConfig
-
-	pubAppImgPersistConfig, err := ps.NewPublication(
-		pubsub.PublicationOptions{
-			AgentName:  agentName,
-			AgentScope: types.AppImgObj,
-			TopicType:  types.PersistImageConfig{},
-		})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.pubAppImgPersistConfig = pubAppImgPersistConfig
-
 	pubUuidToNum, err := ps.NewPublication(pubsub.PublicationOptions{
 		AgentName:  agentName,
 		Persistent: true,
@@ -187,20 +133,10 @@ func Run(ps *pubsub.PubSub) {
 	ctx.pubUuidToNum = pubUuidToNum
 	pubUuidToNum.ClearRestarted()
 
-	pubAppAndImageToHash, err := ps.NewPublication(pubsub.PublicationOptions{
-		AgentName:  agentName,
-		Persistent: true,
-		TopicType:  types.AppAndImageToHash{},
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.pubAppAndImageToHash = pubAppAndImageToHash
-
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "",
-		TopicImpl:     types.GlobalConfig{},
+		TopicImpl:     types.ConfigItemValueMap{},
 		Activate:      false,
 		Ctx:           &ctx,
 		CreateHandler: handleGlobalConfigModify,
@@ -233,6 +169,25 @@ func Run(ps *pubsub.PubSub) {
 	}
 	ctx.subAppInstanceConfig = subAppInstanceConfig
 	subAppInstanceConfig.Activate()
+
+	// Look for VolumeRefStatus from volumemgr
+	subVolumeRefStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:     "volumemgr",
+		AgentScope:    types.AppImgObj,
+		TopicImpl:     types.VolumeRefStatus{},
+		Activate:      false,
+		Ctx:           &ctx,
+		CreateHandler: handleVolumeRefStatusModify,
+		ModifyHandler: handleVolumeRefStatusModify,
+		DeleteHandler: handleVolumeRefStatusDelete,
+		WarningTime:   warningTime,
+		ErrorTime:     errorTime,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	ctx.subVolumeRefStatus = subVolumeRefStatus
+	subVolumeRefStatus.Activate()
 
 	// Get AppNetworkStatus from zedrouter
 	subAppNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
@@ -271,135 +226,6 @@ func Run(ps *pubsub.PubSub) {
 	ctx.subDomainStatus = subDomainStatus
 	subDomainStatus.Activate()
 
-	// Get DomainStatus from domainmgr
-	subImageStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:      "domainmgr",
-		TopicImpl:      types.ImageStatus{},
-		Activate:       false,
-		Ctx:            &ctx,
-		WarningTime:    warningTime,
-		ErrorTime:      errorTime,
-		RestartHandler: handleImageStatusRestarted,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subImageStatus = subImageStatus
-	subImageStatus.Activate()
-
-	// Look for DownloaderStatus from downloader
-	subAppImgDownloadStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:     "downloader",
-		AgentScope:    types.AppImgObj,
-		TopicImpl:     types.DownloaderStatus{},
-		Activate:      false,
-		Ctx:           &ctx,
-		CreateHandler: handleDownloaderStatusModify,
-		ModifyHandler: handleDownloaderStatusModify,
-		DeleteHandler: handleDownloaderStatusDelete,
-		WarningTime:   warningTime,
-		ErrorTime:     errorTime,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subAppImgDownloadStatus = subAppImgDownloadStatus
-	subAppImgDownloadStatus.Activate()
-
-	// Look for VerifyImageStatus from verifier
-	subAppImgVerifierStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:      "verifier",
-		AgentScope:     types.AppImgObj,
-		TopicImpl:      types.VerifyImageStatus{},
-		Activate:       false,
-		Ctx:            &ctx,
-		CreateHandler:  handleVerifyImageStatusModify,
-		ModifyHandler:  handleVerifyImageStatusModify,
-		DeleteHandler:  handleVerifyImageStatusDelete,
-		RestartHandler: handleVerifierRestarted,
-		WarningTime:    warningTime,
-		ErrorTime:      errorTime,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subAppImgVerifierStatus = subAppImgVerifierStatus
-	subAppImgVerifierStatus.Activate()
-
-	// Look for PersistImageStatus from verifier
-	subAppImgPersistStatus, err := ps.NewSubscription(
-		pubsub.SubscriptionOptions{
-			AgentName:     "verifier",
-			AgentScope:    types.AppImgObj,
-			TopicImpl:     types.PersistImageStatus{},
-			Activate:      false,
-			Ctx:           &ctx,
-			CreateHandler: handlePersistImageStatusModify,
-			ModifyHandler: handlePersistImageStatusModify,
-			DeleteHandler: handlePersistImageStatusDelete,
-			WarningTime:   warningTime,
-			ErrorTime:     errorTime,
-		})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subAppImgPersistStatus = subAppImgPersistStatus
-	subAppImgPersistStatus.Activate()
-
-	// Get IdentityStatus from identitymgr
-	subEIDStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:      "identitymgr",
-		TopicImpl:      types.EIDStatus{},
-		Activate:       false,
-		Ctx:            &ctx,
-		CreateHandler:  handleEIDStatusModify,
-		ModifyHandler:  handleEIDStatusModify,
-		DeleteHandler:  handleEIDStatusDelete,
-		RestartHandler: handleIdentitymgrRestarted,
-		WarningTime:    warningTime,
-		ErrorTime:      errorTime,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subEIDStatus = subEIDStatus
-	subEIDStatus.Activate()
-
-	subDeviceNetworkStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:     "nim",
-		TopicImpl:     types.DeviceNetworkStatus{},
-		Activate:      false,
-		Ctx:           &ctx,
-		CreateHandler: handleDNSModify,
-		ModifyHandler: handleDNSModify,
-		DeleteHandler: handleDNSDelete,
-		WarningTime:   warningTime,
-		ErrorTime:     errorTime,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subDeviceNetworkStatus = subDeviceNetworkStatus
-	subDeviceNetworkStatus.Activate()
-
-	// Look for CertObjStatus from baseosmgr
-	subCertObjStatus, err := ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:     "baseosmgr",
-		TopicImpl:     types.CertObjStatus{},
-		Activate:      false,
-		Ctx:           &ctx,
-		CreateHandler: handleCertObjStatusModify,
-		ModifyHandler: handleCertObjStatusModify,
-		DeleteHandler: handleCertObjStatusDelete,
-		WarningTime:   warningTime,
-		ErrorTime:     errorTime,
-	})
-	if err != nil {
-		log.Fatal(err)
-	}
-	ctx.subCertObjStatus = subCertObjStatus
-	subCertObjStatus.Activate()
-
 	// Pick up debug aka log level before we start real work
 	for !ctx.GCInitialized {
 		log.Infof("waiting for GCInitialized")
@@ -410,59 +236,14 @@ func Run(ps *pubsub.PubSub) {
 		}
 		agentlog.StillRunning(agentName, warningTime, errorTime)
 	}
-	log.Infof("processed GlobalConfig")
-
-	// First we process the verifierStatus and ImageStatus to avoid downloading
-	// an image we already have in place.
-	for !ctx.verifierRestarted || !ctx.rwImageAvailable {
-		log.Infof("Waiting for verifier %t rwImageAvailable %t",
-			ctx.verifierRestarted, ctx.rwImageAvailable)
-
-		select {
-		case change := <-subGlobalConfig.MsgChan():
-			subGlobalConfig.ProcessChange(change)
-
-		case change := <-subAppImgVerifierStatus.MsgChan():
-			subAppImgVerifierStatus.ProcessChange(change)
-			if ctx.verifierRestarted {
-				log.Infof("Verifier reported restarted\n")
-			}
-
-		case change := <-subAppImgPersistStatus.MsgChan():
-			subAppImgPersistStatus.ProcessChange(change)
-
-		case change := <-subImageStatus.MsgChan():
-			subImageStatus.ProcessChange(change)
-			if ctx.rwImageAvailable {
-				log.Infof("rwImageAvailable\n")
-			}
-
-		case <-stillRunning.C:
-		}
-		agentlog.StillRunning(agentName, warningTime, errorTime)
-	}
-
-	log.Infof("Handling all inputs\n")
+	log.Infof("Handling all inputs")
 	for {
 		select {
 		case change := <-subGlobalConfig.MsgChan():
 			subGlobalConfig.ProcessChange(change)
 
-		// handle cert ObjectsChanges
-		case change := <-subCertObjStatus.MsgChan():
-			subCertObjStatus.ProcessChange(change)
-
-		case change := <-subAppImgDownloadStatus.MsgChan():
-			subAppImgDownloadStatus.ProcessChange(change)
-
-		case change := <-subAppImgVerifierStatus.MsgChan():
-			subAppImgVerifierStatus.ProcessChange(change)
-
-		case change := <-subAppImgPersistStatus.MsgChan():
-			subAppImgPersistStatus.ProcessChange(change)
-
-		case change := <-subEIDStatus.MsgChan():
-			subEIDStatus.ProcessChange(change)
+		case change := <-subVolumeRefStatus.MsgChan():
+			subVolumeRefStatus.ProcessChange(change)
 
 		case change := <-subAppNetworkStatus.MsgChan():
 			subAppNetworkStatus.ProcessChange(change)
@@ -470,14 +251,8 @@ func Run(ps *pubsub.PubSub) {
 		case change := <-subDomainStatus.MsgChan():
 			subDomainStatus.ProcessChange(change)
 
-		case change := <-subImageStatus.MsgChan():
-			subImageStatus.ProcessChange(change)
-
 		case change := <-subAppInstanceConfig.MsgChan():
 			subAppInstanceConfig.ProcessChange(change)
-
-		case change := <-subDeviceNetworkStatus.MsgChan():
-			subDeviceNetworkStatus.ProcessChange(change)
 
 		case <-stillRunning.C:
 		}
@@ -489,47 +264,22 @@ func Run(ps *pubsub.PubSub) {
 // AppInstanceConfig (which triggers this callback) we propagate a sequence of
 // restarts so that the agents don't do extra work.
 // We propagate a seqence of restarted from the zedmanager config
-// and verifier status to identitymgr, then from identitymgr to zedrouter,
+// to identitymgr, then from identitymgr to zedrouter,
 // and finally from zedrouter to domainmgr.
-// This removes the need for extra downloads/verifications and extra copying
-// of the rootfs in domainmgr.
+// XXX is that sequence still needed with volumemgr in place?
+// Need EIDs before zedrouter ...
 func handleConfigRestart(ctxArg interface{}, done bool) {
 	ctx := ctxArg.(*zedmanagerContext)
-
-	log.Infof("handleConfigRestart(%v)\n", done)
+	log.Infof("handleConfigRestart(%v)", done)
 	if done {
-		ctx.configRestarted = true
-		if ctx.verifierRestarted {
-			ctx.pubEIDConfig.SignalRestarted()
-		}
-	}
-}
-
-func handleVerifierRestarted(ctxArg interface{}, done bool) {
-	ctx := ctxArg.(*zedmanagerContext)
-
-	log.Infof("handleVerifierRestarted(%v)\n", done)
-	if done {
-		ctx.verifierRestarted = true
-		if ctx.configRestarted {
-			ctx.pubEIDConfig.SignalRestarted()
-		}
-	}
-}
-
-func handleImageStatusRestarted(ctxArg interface{}, done bool) {
-	ctx := ctxArg.(*zedmanagerContext)
-
-	log.Infof("handleImageStatusRestarted(%v)\n", done)
-	if done {
-		ctx.rwImageAvailable = true
+		ctx.pubAppNetworkConfig.SignalRestarted()
 	}
 }
 
 func handleIdentitymgrRestarted(ctxArg interface{}, done bool) {
 	ctx := ctxArg.(*zedmanagerContext)
 
-	log.Infof("handleIdentitymgrRestarted(%v)\n", done)
+	log.Infof("handleIdentitymgrRestarted(%v)", done)
 	if done {
 		ctx.pubAppNetworkConfig.SignalRestarted()
 	}
@@ -538,7 +288,7 @@ func handleIdentitymgrRestarted(ctxArg interface{}, done bool) {
 func handleZedrouterRestarted(ctxArg interface{}, done bool) {
 	ctx := ctxArg.(*zedmanagerContext)
 
-	log.Infof("handleZedrouterRestarted(%v)\n", done)
+	log.Infof("handleZedrouterRestarted(%v)", done)
 	if done {
 		ctx.pubDomainConfig.SignalRestarted()
 	}
@@ -548,7 +298,7 @@ func publishAppInstanceStatus(ctx *zedmanagerContext,
 	status *types.AppInstanceStatus) {
 
 	key := status.Key()
-	log.Debugf("publishAppInstanceStatus(%s)\n", key)
+	log.Debugf("publishAppInstanceStatus(%s)", key)
 	pub := ctx.pubAppInstanceStatus
 	pub.Publish(key, *status)
 }
@@ -557,11 +307,11 @@ func unpublishAppInstanceStatus(ctx *zedmanagerContext,
 	status *types.AppInstanceStatus) {
 
 	key := status.Key()
-	log.Debugf("unpublishAppInstanceStatus(%s)\n", key)
+	log.Debugf("unpublishAppInstanceStatus(%s)", key)
 	pub := ctx.pubAppInstanceStatus
 	st, _ := pub.Get(key)
 	if st == nil {
-		log.Errorf("unpublishAppInstanceStatus(%s) not found\n", key)
+		log.Errorf("unpublishAppInstanceStatus(%s) not found", key)
 		return
 	}
 	pub.Unpublish(key)
@@ -570,15 +320,15 @@ func unpublishAppInstanceStatus(ctx *zedmanagerContext,
 func handleAppInstanceConfigDelete(ctxArg interface{}, key string,
 	configArg interface{}) {
 
-	log.Infof("handleAppInstanceConfigDelete(%s)\n", key)
+	log.Infof("handleAppInstanceConfigDelete(%s)", key)
 	ctx := ctxArg.(*zedmanagerContext)
 	status := lookupAppInstanceStatus(ctx, key)
 	if status == nil {
-		log.Infof("handleAppInstanceConfigDelete: unknown %s\n", key)
+		log.Infof("handleAppInstanceConfigDelete: unknown %s", key)
 		return
 	}
 	handleDelete(ctx, key, status)
-	log.Infof("handleAppInstanceConfigDelete(%s) done\n", key)
+	log.Infof("handleAppInstanceConfigDelete(%s) done", key)
 }
 
 // Callers must be careful to publish any changes to AppInstanceStatus
@@ -587,7 +337,7 @@ func lookupAppInstanceStatus(ctx *zedmanagerContext, key string) *types.AppInsta
 	pub := ctx.pubAppInstanceStatus
 	st, _ := pub.Get(key)
 	if st == nil {
-		log.Infof("lookupAppInstanceStatus(%s) not found\n", key)
+		log.Infof("lookupAppInstanceStatus(%s) not found", key)
 		return nil
 	}
 	status := st.(types.AppInstanceStatus)
@@ -599,7 +349,7 @@ func lookupAppInstanceConfig(ctx *zedmanagerContext, key string) *types.AppInsta
 	sub := ctx.subAppInstanceConfig
 	c, _ := sub.Get(key)
 	if c == nil {
-		log.Infof("lookupAppInstanceConfig(%s) not found\n", key)
+		log.Infof("lookupAppInstanceConfig(%s) not found", key)
 		return nil
 	}
 	config := c.(types.AppInstanceConfig)
@@ -611,18 +361,18 @@ func handleCreate(ctxArg interface{}, key string,
 	ctx := ctxArg.(*zedmanagerContext)
 	config := configArg.(types.AppInstanceConfig)
 
-	log.Infof("handleCreate(%v) for %s\n",
+	log.Infof("handleCreate(%v) for %s",
 		config.UUIDandVersion, config.DisplayName)
 
 	status := types.AppInstanceStatus{
 		UUIDandVersion:      config.UUIDandVersion,
 		DisplayName:         config.DisplayName,
 		FixedResources:      config.FixedResources,
-		OverlayNetworkList:  config.OverlayNetworkList,
 		UnderlayNetworkList: config.UnderlayNetworkList,
 		IoAdapterList:       config.IoAdapterList,
 		RestartCmd:          config.RestartCmd,
 		PurgeCmd:            config.PurgeCmd,
+		State:               types.INITIAL,
 	}
 
 	// Do we have a PurgeCmd counter from before the reboot?
@@ -630,48 +380,43 @@ func handleCreate(ctxArg interface{}, key string,
 		config.UUIDandVersion.UUID, "purgeCmdCounter")
 	if err == nil {
 		if uint32(c) == status.PurgeCmd.Counter {
-			log.Infof("handleCreate(%v) for %s found matching purge counter %d\n",
+			log.Infof("handleCreate(%v) for %s found matching purge counter %d",
 				config.UUIDandVersion, config.DisplayName, c)
 		} else {
-			log.Warnf("handleCreate(%v) for %s found different purge counter %d vs. %d\n",
+			log.Warnf("handleCreate(%v) for %s found different purge counter %d vs. %d",
 				config.UUIDandVersion, config.DisplayName, c,
 				config.PurgeCmd.Counter)
 			status.PurgeCmd.Counter = config.PurgeCmd.Counter
-			status.PurgeInprogress = types.DOWNLOAD
+			status.PurgeInprogress = types.RecreateVolumes
 			status.State = types.PURGING
 			// We persist the PurgeCmd Counter when
 			// PurgeInprogress is done
 		}
 	} else {
 		// Save this PurgeCmd.Counter as the baseline
-		log.Infof("handleCreate(%v) for %s saving purge counter %d\n",
+		log.Infof("handleCreate(%v) for %s saving purge counter %d",
 			config.UUIDandVersion, config.DisplayName,
 			config.PurgeCmd.Counter)
 		uuidtonum.UuidToNumAllocate(ctx.pubUuidToNum,
 			config.UUIDandVersion.UUID, int(config.PurgeCmd.Counter),
 			true, "purgeCmdCounter")
 	}
-	status.StorageStatusList = make([]types.StorageStatus,
-		len(config.StorageConfigList))
-	for i, sc := range config.StorageConfigList {
-		ss := &status.StorageStatusList[i]
-		ss.UpdateFromStorageConfig(sc)
-		if ss.IsContainer {
-			// FIXME - We really need a top level flag to tell the app is
-			//  a container. Deriving it from Storage seems hacky.
-			status.IsContainer = true
-		}
-		maybeLatchImageSha(ctx, config, ss)
+
+	status.VolumeRefStatusList = make([]types.VolumeRefStatus,
+		len(config.VolumeRefConfigList))
+	for i, vrc := range config.VolumeRefConfigList {
+		vrs := &status.VolumeRefStatusList[i]
+		vrs.VolumeID = vrc.VolumeID
+		vrs.GenerationCounter = vrc.GenerationCounter
+		vrs.RefCount = vrc.RefCount
+		vrs.PendingAdd = true
 	}
 
-	status.EIDList = make([]types.EIDStatusDetails,
-		len(config.OverlayNetworkList))
-
+	allErrors := ""
 	if len(config.Errors) > 0 {
 		// Combine all errors from Config parsing state and send them in Status
-		status.Error = ""
 		for i, errStr := range config.Errors {
-			status.Error += errStr
+			allErrors += errStr
 			log.Errorf("App Instance %s-%s: Error(%d): %s",
 				config.DisplayName, config.UUIDandVersion.UUID, i, errStr)
 		}
@@ -682,23 +427,21 @@ func handleCreate(ctxArg interface{}, key string,
 	// Do some basic sanity checks.
 	if config.FixedResources.Memory == 0 {
 		errStr := "Invalid Memory Size - 0\n"
-		status.Error += errStr
+		allErrors += errStr
 	}
 	if config.FixedResources.VCpus == 0 {
 		errStr := "Invalid Cpu count - 0\n"
-		status.Error += errStr
+		allErrors += errStr
 	}
-	if status.Error != "" {
-		status.SetError(status.Error, "Zedmanager Create Handler",
-			time.Now())
-	}
-	publishAppInstanceStatus(ctx, &status)
 
 	// if some error, return
-	if status.Error != "" {
+	if allErrors != "" {
 		log.Errorf("AppInstance(Name:%s, UUID:%s): Errors in App Instance "+
 			"Create. Error: %s",
-			config.DisplayName, config.UUIDandVersion.UUID, status.Error)
+			config.DisplayName, config.UUIDandVersion.UUID, allErrors)
+		status.SetErrorWithSource(allErrors, types.AppInstanceStatus{},
+			time.Now())
+		publishAppInstanceStatus(ctx, &status)
 		return
 	}
 
@@ -709,66 +452,16 @@ func handleCreate(ctxArg interface{}, key string,
 			config.DisplayName, config.UUIDandVersion.UUID)
 		publishAppInstanceStatus(ctx, &status)
 	}
-	log.Infof("handleCreate done for %s\n", config.DisplayName)
-}
-
-func maybeLatchImageSha(ctx *zedmanagerContext, config types.AppInstanceConfig,
-	ssPtr *types.StorageStatus) {
-
-	imageSha := lookupAppAndImageHash(ctx, config.UUIDandVersion.UUID,
-		ssPtr.ImageID)
-	if imageSha == "" {
-		if ssPtr.IsContainer && ssPtr.ImageSha256 == "" {
-			log.Infof("Container app/image %s %s/%s has not (yet) latched sha",
-				config.DisplayName, config.UUIDandVersion.UUID,
-				ssPtr.ImageID)
-		}
-		return
-	}
-	if ssPtr.ImageSha256 == "" {
-		log.Infof("Latching %s app/image %s/%s to sha %s",
-			config.DisplayName,
-			config.UUIDandVersion.UUID, ssPtr.ImageID, imageSha)
-		ssPtr.ImageSha256 = imageSha
-		if ssPtr.IsContainer {
-			newName := maybeInsertSha(ssPtr.Name, imageSha)
-			if newName != ssPtr.Name {
-				log.Infof("Changing container name from %s to %s",
-					ssPtr.Name, newName)
-				ssPtr.Name = newName
-			}
-		}
-	} else if ssPtr.ImageSha256 != imageSha {
-		// We already catch this change, but logging here in any case
-		log.Warnf("App/Image %s %s/%s hash sha %s received %s",
-			config.DisplayName,
-			config.UUIDandVersion.UUID, ssPtr.ImageID,
-			imageSha, ssPtr.ImageSha256)
-	}
-}
-
-// Check if the OCI name does not include an explicit sha and if not
-// return the name with the sha inserted.
-// Note that the sha must be lower case in the OCI reference.
-func maybeInsertSha(name string, sha string) string {
-	if strings.Index(name, "@") != -1 {
-		// Already has a sha
-		return name
-	}
-	sha = strings.ToLower(sha)
-	last := strings.LastIndex(name, ":")
-	if last == -1 {
-		return name + "@sha256:" + sha
-	}
-	return name[:last] + "@sha256:" + sha
+	log.Infof("handleCreate done for %s", config.DisplayName)
 }
 
 func handleModify(ctxArg interface{}, key string,
 	configArg interface{}) {
+
 	ctx := ctxArg.(*zedmanagerContext)
 	config := configArg.(types.AppInstanceConfig)
 	status := lookupAppInstanceStatus(ctx, key)
-	log.Infof("handleModify(%v) for %s\n",
+	log.Infof("handleModify(%v) for %s",
 		config.UUIDandVersion, config.DisplayName)
 
 	// We handle at least ACL and activate changes. XXX What else?
@@ -776,14 +469,18 @@ func handleModify(ctxArg interface{}, key string,
 	// some updates.
 
 	// We detect significant changes which require a reboot and/or
-	// purge of disk changes
-	needPurge, needRestart := quantifyChanges(config, *status)
+	// purge of disk changes, so we can generate errors if it is
+	// not a PurgeCmd and RestartCmd, respectively
+	// If we are purging then restart is redundant.
+	needPurge, needRestart, purgeReason, restartReason := quantifyChanges(config, *status)
+	if needPurge {
+		needRestart = false
+	}
 
-	if needRestart ||
-		config.RestartCmd.Counter != status.RestartCmd.Counter {
+	if config.RestartCmd.Counter != status.RestartCmd.Counter {
 
 		log.Infof("handleModify(%v) for %s restartcmd from %d to %d "+
-			"needRestart: %v\n",
+			"needRestart: %v",
 			config.UUIDandVersion, config.DisplayName,
 			status.RestartCmd.Counter, config.RestartCmd.Counter,
 			needRestart)
@@ -792,25 +489,45 @@ func handleModify(ctxArg interface{}, key string,
 			// would also restart the app. Hence we can update
 			// the status counter here.
 			status.RestartCmd.Counter = config.RestartCmd.Counter
-			status.RestartInprogress = types.BRING_DOWN
+			status.RestartInprogress = types.BringDown
 			status.State = types.RESTARTING
 		} else {
-			log.Infof("handleModify(%v) for %s restartcmd ignored config !Activate\n",
+			log.Infof("handleModify(%v) for %s restartcmd ignored config !Activate",
 				config.UUIDandVersion, config.DisplayName)
 			status.RestartCmd.Counter = config.RestartCmd.Counter
 		}
+	} else if needRestart {
+		errStr := fmt.Sprintf("Need restart due to %s but not a restartCmd",
+			restartReason)
+		log.Errorf("handleModify(%s) failed: %s", status.Key(), errStr)
+		status.SetError(errStr, time.Now())
+		publishAppInstanceStatus(ctx, status)
+		return
 	}
-	if needPurge || config.PurgeCmd.Counter != status.PurgeCmd.Counter {
+
+	if config.PurgeCmd.Counter != status.PurgeCmd.Counter {
 		log.Infof("handleModify(%v) for %s purgecmd from %d to %d "+
-			"needPurge: %v\n",
+			"needPurge: %v",
 			config.UUIDandVersion, config.DisplayName,
 			status.PurgeCmd.Counter, config.PurgeCmd.Counter,
 			needPurge)
+		if status.IsErrorSource(types.AppInstanceStatus{}) {
+			log.Infof("Removing error %s", status.Error)
+			status.ClearErrorWithSource()
+		}
 		status.PurgeCmd.Counter = config.PurgeCmd.Counter
-		status.PurgeInprogress = types.DOWNLOAD
+		status.PurgeInprogress = types.RecreateVolumes
 		status.State = types.PURGING
 		// We persist the PurgeCmd Counter when PurgeInprogress is done
+	} else if needPurge {
+		errStr := fmt.Sprintf("Need purge due to %s but not a purgeCmd",
+			purgeReason)
+		log.Errorf("handleModify(%s) failed: %s", status.Key(), errStr)
+		status.SetError(errStr, time.Now())
+		publishAppInstanceStatus(ctx, status)
+		return
 	}
+
 	status.UUIDandVersion = config.UUIDandVersion
 	publishAppInstanceStatus(ctx, status)
 
@@ -820,185 +537,111 @@ func handleModify(ctxArg interface{}, key string,
 		publishAppInstanceStatus(ctx, status)
 	}
 	status.FixedResources = config.FixedResources
-	status.OverlayNetworkList = config.OverlayNetworkList
 	status.UnderlayNetworkList = config.UnderlayNetworkList
 	status.IoAdapterList = config.IoAdapterList
 	publishAppInstanceStatus(ctx, status)
-	log.Infof("handleModify done for %s\n", config.DisplayName)
+	log.Infof("handleModify done for %s", config.DisplayName)
 }
 
 func handleDelete(ctx *zedmanagerContext, key string,
 	status *types.AppInstanceStatus) {
 
-	log.Infof("handleDelete(%v) for %s\n",
+	log.Infof("handleDelete(%v) for %s",
 		status.UUIDandVersion, status.DisplayName)
 
 	removeAIStatus(ctx, status)
 	// Remove the recorded PurgeCmd Counter
 	uuidtonum.UuidToNumDelete(ctx.pubUuidToNum, status.UUIDandVersion.UUID)
-	purgeAppAndImageHash(ctx, status.UUIDandVersion.UUID)
-	log.Infof("handleDelete done for %s\n", status.DisplayName)
+	log.Infof("handleDelete done for %s", status.DisplayName)
 }
 
-// Returns needRestart, needPurge
+// Returns needRestart, needPurge, plus a string for each.
 // If there is a change to the disks, adapters, or network interfaces
 // it returns needPurge.
 // If there is a change to the CPU etc resources it returns needRestart
 // Changes to ACLs don't result in either being returned.
 func quantifyChanges(config types.AppInstanceConfig,
-	status types.AppInstanceStatus) (bool, bool) {
+	status types.AppInstanceStatus) (bool, bool, string, string) {
 
 	needPurge := false
 	needRestart := false
-	log.Infof("quantifyChanges for %s %s\n",
+	var purgeReason, restartReason string
+	log.Infof("quantifyChanges for %s %s",
 		config.Key(), config.DisplayName)
-	if len(status.StorageStatusList) != len(config.StorageConfigList) {
-		log.Infof("quantifyChanges len storage changed from %d to %d\n",
-			len(status.StorageStatusList),
-			len(config.StorageConfigList))
+	if len(status.VolumeRefStatusList) != len(config.VolumeRefConfigList) {
+		str := fmt.Sprintf("number of volume ref changed from %d to %d",
+			len(status.VolumeRefStatusList),
+			len(config.VolumeRefConfigList))
+		log.Infof(str)
 		needPurge = true
+		purgeReason += str + "\n"
 	} else {
-		for i, sc := range config.StorageConfigList {
-			ss := status.StorageStatusList[i]
-			if ss.ImageID != sc.ImageID {
-				log.Infof("quantifyChanges storage imageID changed from %s to %s\n",
-					ss.ImageID, sc.ImageID)
+		for _, vrc := range config.VolumeRefConfigList {
+			vrs := getVolumeRefStatusFromAIStatus(&status, vrc)
+			if vrs == nil {
+				str := fmt.Sprintf("Missing VolumeRefStatus for (VolumeID: %s, GenerationCounter: %d)",
+					vrc.VolumeID, vrc.GenerationCounter)
+				log.Errorf(str)
 				needPurge = true
-			}
-			if ss.ReadOnly != sc.ReadOnly {
-				log.Infof("quantifyChanges storage ReadOnly changed from %v to %v\n",
-					ss.ReadOnly, sc.ReadOnly)
-				needPurge = true
-			}
-			if ss.Preserve != sc.Preserve {
-				log.Infof("quantifyChanges storage Preserve changed from %v to %v\n",
-					ss.Preserve, sc.Preserve)
-				needPurge = true
-			}
-			if ss.Format != sc.Format {
-				log.Infof("quantifyChanges storage Format changed from %v to %v\n",
-					ss.Format, sc.Format)
-				needPurge = true
-			}
-			if ss.Maxsizebytes != sc.Maxsizebytes {
-				log.Infof("quantifyChanges storage Maxsizebytes changed from %v to %v\n",
-					ss.Maxsizebytes, sc.Maxsizebytes)
-				needPurge = true
-			}
-			if ss.Devtype != sc.Devtype {
-				log.Infof("quantifyChanges storage Devtype changed from %v to %v\n",
-					ss.Devtype, sc.Devtype)
-				needPurge = true
-			}
-		}
-	}
-	// Compare networks without comparing ACLs
-	if len(status.OverlayNetworkList) != len(config.OverlayNetworkList) {
-		log.Infof("quantifyChanges len storage changed from %d to %d\n",
-			len(status.OverlayNetworkList),
-			len(config.OverlayNetworkList))
-		needPurge = true
-	} else {
-		for i, oc := range config.OverlayNetworkList {
-			os := status.OverlayNetworkList[i]
-			if !cmp.Equal(oc.EIDConfigDetails, os.EIDConfigDetails) {
-				log.Infof("quantifyChanges EIDConfigDetails changed: %v\n",
-					cmp.Diff(oc.EIDConfigDetails, os.EIDConfigDetails))
-				needPurge = true
-			}
-			if os.AppMacAddr.String() != oc.AppMacAddr.String() {
-				log.Infof("quantifyChanges AppMacAddr changed from %v to %v\n",
-					os.AppMacAddr, oc.AppMacAddr)
-				needPurge = true
-			}
-			if !os.AppIPAddr.Equal(oc.AppIPAddr) {
-				log.Infof("quantifyChanges AppIPAddr changed from %v to %v\n",
-					os.AppIPAddr, oc.AppIPAddr)
-				needPurge = true
-			}
-			if os.Network != oc.Network {
-				log.Infof("quantifyChanges Network changed from %v to %v\n",
-					os.Network, oc.Network)
-				needPurge = true
-			}
-			if !cmp.Equal(oc.ACLs, os.ACLs) {
-				log.Infof("quantifyChanges FYI ACLs changed: %v\n",
-					cmp.Diff(oc.ACLs, os.ACLs))
+				purgeReason += str + "\n"
+				continue
 			}
 		}
 	}
 	if len(status.UnderlayNetworkList) != len(config.UnderlayNetworkList) {
-		log.Infof("quantifyChanges len storage changed from %d to %d\n",
+		str := fmt.Sprintf("number of underlay interfaces changed from %d to %d",
 			len(status.UnderlayNetworkList),
 			len(config.UnderlayNetworkList))
+		log.Infof(str)
 		needPurge = true
+		purgeReason += str + "\n"
 	} else {
 		for i, uc := range config.UnderlayNetworkList {
 			us := status.UnderlayNetworkList[i]
 			if us.AppMacAddr.String() != uc.AppMacAddr.String() {
-				log.Infof("quantifyChanges AppMacAddr changed from %v to %v\n",
+				str := fmt.Sprintf("AppMacAddr changed from %v to %v",
 					us.AppMacAddr, uc.AppMacAddr)
+				log.Infof(str)
 				needPurge = true
+				purgeReason += str + "\n"
 			}
 			if !us.AppIPAddr.Equal(uc.AppIPAddr) {
-				log.Infof("quantifyChanges AppIPAddr changed from %v to %v\n",
+				str := fmt.Sprintf("AppIPAddr changed from %v to %v",
 					us.AppIPAddr, uc.AppIPAddr)
+				log.Infof(str)
 				needPurge = true
+				purgeReason += str + "\n"
 			}
 			if us.Network != uc.Network {
-				log.Infof("quantifyChanges Network changed from %v to %v\n",
+				str := fmt.Sprintf("Network changed from %v to %v",
 					us.Network, uc.Network)
+				log.Infof(str)
 				needPurge = true
+				purgeReason += str + "\n"
 			}
 			if !cmp.Equal(uc.ACLs, us.ACLs) {
-				log.Infof("quantifyChanges FYI ACLs changed: %v\n",
+				log.Infof("FYI ACLs changed: %v",
 					cmp.Diff(uc.ACLs, us.ACLs))
 			}
 		}
 	}
 	if !cmp.Equal(config.IoAdapterList, status.IoAdapterList) {
-		log.Infof("quantifyChanges IoAdapterList changed: %v\n",
+		str := fmt.Sprintf("IoAdapterList changed: %v",
 			cmp.Diff(config.IoAdapterList, status.IoAdapterList))
+		log.Infof(str)
 		needPurge = true
+		purgeReason += str + "\n"
 	}
 	if !cmp.Equal(config.FixedResources, status.FixedResources) {
-		log.Infof("quantifyChanges FixedResources changed: %v\n",
+		str := fmt.Sprintf("FixedResources changed: %v",
 			cmp.Diff(config.FixedResources, status.FixedResources))
+		log.Infof(str)
 		needRestart = true
+		restartReason += str + "\n"
 	}
-	log.Infof("quantifyChanges for %s %s returns %v, %v\n",
+	log.Infof("quantifyChanges for %s %s returns %v, %v",
 		config.Key(), config.DisplayName, needPurge, needRestart)
-	return needPurge, needRestart
-}
-
-// Handles both create and modify events
-func handleDNSModify(ctxArg interface{}, key string, statusArg interface{}) {
-
-	status := statusArg.(types.DeviceNetworkStatus)
-	if key != "global" {
-		log.Debugf("handleDNSModify: ignoring %s\n", key)
-		return
-	}
-	log.Infof("handleDNSModify for %s\n", key)
-	if cmp.Equal(deviceNetworkStatus, status) {
-		log.Infof("handleDNSModify no change\n")
-		return
-	}
-	log.Infof("handleDNSModify: changed %v",
-		cmp.Diff(deviceNetworkStatus, status))
-	deviceNetworkStatus = status
-	log.Infof("handleDNSModify done for %s\n", key)
-}
-
-func handleDNSDelete(ctxArg interface{}, key string, statusArg interface{}) {
-
-	log.Infof("handleDNSDelete for %s\n", key)
-	if key != "global" {
-		log.Infof("handleDNSDelete: ignoring %s\n", key)
-		return
-	}
-	deviceNetworkStatus = types.DeviceNetworkStatus{}
-	log.Infof("handleDNSDelete done for %s\n", key)
+	return needPurge, needRestart, purgeReason, restartReason
 }
 
 // Handles both create and modify events
@@ -1007,18 +650,18 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedmanagerContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigModify: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigModify: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigModify for %s\n", key)
-	var gcp *types.GlobalConfig
+	log.Infof("handleGlobalConfigModify for %s", key)
+	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
 	if gcp != nil {
 		ctx.globalConfig = gcp
 		ctx.GCInitialized = true
 	}
-	log.Infof("handleGlobalConfigModify done for %s\n", key)
+	log.Infof("handleGlobalConfigModify done for %s", key)
 }
 
 func handleGlobalConfigDelete(ctxArg interface{}, key string,
@@ -1026,12 +669,12 @@ func handleGlobalConfigDelete(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*zedmanagerContext)
 	if key != "global" {
-		log.Infof("handleGlobalConfigDelete: ignoring %s\n", key)
+		log.Infof("handleGlobalConfigDelete: ignoring %s", key)
 		return
 	}
-	log.Infof("handleGlobalConfigDelete for %s\n", key)
+	log.Infof("handleGlobalConfigDelete for %s", key)
 	debug, _ = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
-	*ctx.globalConfig = types.GlobalConfigDefaults
-	log.Infof("handleGlobalConfigDelete done for %s\n", key)
+	*ctx.globalConfig = *types.DefaultConfigItemValueMap()
+	log.Infof("handleGlobalConfigDelete done for %s", key)
 }

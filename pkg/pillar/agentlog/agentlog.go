@@ -1,4 +1,4 @@
-// Copyright (c) 2018 Zededa, Inc.
+// Copyright (c) 2018,2020 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 package agentlog
@@ -10,10 +10,13 @@ import (
 	"os/signal"
 	"runtime"
 	dbg "runtime/debug"
+	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zboot"
 	log "github.com/sirupsen/logrus"
@@ -25,43 +28,35 @@ const (
 	rebootImage = "reboot-image"
 )
 
-var savedAgentName = "unknown" // Keep for signal and exit handlers
 var savedRebootReason = "unknown"
-var savedPid = 0
 
-// Parameter description
-// 1. agentName: Name with which disk log file will be created.
-// 2. logdir: Directory in which disk log file will be placed.
-func initImpl(agentName string, logdir string) error {
-	log.SetOutput(os.Stdout)
-	hook := new(FatalHook)
-	log.AddHook(hook)
-	hook2 := new(SourceHook)
-	log.AddHook(hook2)
-	// Report nano timestamps
-	formatter := log.JSONFormatter{
-		TimestampFormat: time.RFC3339Nano,
+var onceLock = &sync.Mutex{}
+var onceVal bool
+
+// once returns true the first time and then false
+func once() bool {
+	onceLock.Lock()
+	defer onceLock.Unlock()
+	if onceVal {
+		return false
+	} else {
+		onceVal = true
+		return true
 	}
-	log.SetFormatter(&formatter)
-	log.SetReportCaller(true)
-	log.RegisterExitHandler(printStack)
-
-	sigs := make(chan os.Signal, 1)
-	signal.Notify(sigs, syscall.SIGUSR1)
-	signal.Notify(sigs, syscall.SIGUSR2)
-	go handleSignals(sigs)
-	return nil
 }
 
 // FatalHook is used make sure we save the fatal and panic strings to a file
 type FatalHook struct {
+	agentName string
+	agentPid  int
 }
 
 // Fire saves the reason for the log.Fatal or log.Panic
 func (hook *FatalHook) Fire(entry *log.Entry) error {
-	reason := fmt.Sprintf("fatal: agent %s[%d]: %s", savedAgentName, savedPid, entry.Message)
+	reason := fmt.Sprintf("fatal: agent %s[%d]: %s", hook.agentName,
+		hook.agentPid, entry.Message)
 	savedRebootReason = reason
-	RebootReason(reason, false)
+	RebootReason(reason, hook.agentName, hook.agentPid, false)
 	return nil
 }
 
@@ -73,14 +68,16 @@ func (hook *FatalHook) Levels() []log.Level {
 	}
 }
 
-// SourceHook is used to add source=agentName
+// SourceHook is used to add source and pid
 type SourceHook struct {
+	agentName string
+	agentPid  int
 }
 
-// Fire adds source=agentName
+// Fire adds source and pid
 func (hook *SourceHook) Fire(entry *log.Entry) error {
-	entry.Data["source"] = savedAgentName
-	entry.Data["pid"] = savedPid
+	entry.Data["source"] = hook.agentName
+	entry.Data["pid"] = hook.agentPid
 	return nil
 }
 
@@ -90,7 +87,11 @@ func (hook *SourceHook) Levels() []log.Level {
 }
 
 // Wait on channel then handle the signals
-func handleSignals(sigs chan os.Signal) {
+func handleSignals(agentName string, agentPid int, sigs chan os.Signal) {
+	agentDebugDir := fmt.Sprintf("%s/%s/", types.PersistDebugDir, agentName)
+	sigUsr1FileName := agentDebugDir + "/sigusr1"
+	sigUsr2FileName := agentDebugDir + "/sigusr2"
+
 	for {
 		select {
 		case sig := <-sigs:
@@ -99,6 +100,19 @@ func handleSignals(sigs chan os.Signal) {
 			case syscall.SIGUSR1:
 				stacks := getStacks(true)
 				stackArray := strings.Split(stacks, "\n\n")
+
+				sigUsr1File, err := os.OpenFile(sigUsr1FileName,
+					os.O_WRONLY|os.O_CREATE|os.O_SYNC|os.O_TRUNC, 0755)
+				if err == nil {
+					for _, stack := range stackArray {
+						// This goes to /persist/agentdebug/<agentname>/sigusr1 file
+						sigUsr1File.WriteString(stack)
+					}
+					sigUsr1File.Close()
+				} else {
+					log.Errorf("handleSignals: Error opening file %s with: %s", sigUsr1FileName, err)
+				}
+
 				log.Warnf("SIGUSR1 triggered with %d stacks", len(stackArray))
 				for _, stack := range stackArray {
 					log.Warnf("%v", stack)
@@ -106,18 +120,30 @@ func handleSignals(sigs chan os.Signal) {
 				log.Warnf("SIGUSR1: end of stacks")
 				// Could result in a watchdog reboot hence
 				// we save it as a reboot-stack
-				RebootStack(stacks)
+				RebootStack(stacks, agentName, agentPid)
 			case syscall.SIGUSR2:
 				log.Warnf("SIGUSR2 triggered memory info:\n")
-				logMemUsage()
-				logGCStats()
+				sigUsr2File, err := os.OpenFile(sigUsr2FileName,
+					os.O_WRONLY|os.O_CREATE|os.O_SYNC|os.O_TRUNC, 0755)
+				if err != nil {
+					log.Errorf("handleSignals: Error opening file %s with: %s", sigUsr2FileName, err)
+				} else {
+					// This goes to /persist/agentdebug/<agentname>/sigusr2 file
+					sigUsr2File.WriteString("SIGUSR2 triggered memory info:\n")
+				}
+
+				logMemUsage(sigUsr2File)
+				logMemAllocationSites(sigUsr2File)
+				if sigUsr2File != nil {
+					sigUsr2File.Close()
+				}
 			}
 		}
 	}
 }
 
 // Print out our stack
-func printStack() {
+func printStack(agentName string, agentPid int) {
 	stacks := getStacks(false)
 	stackArray := strings.Split(stacks, "\n\n")
 	log.Errorf("Fatal stack trace due to %s with %d stack traces", savedRebootReason, len(stackArray))
@@ -125,22 +151,23 @@ func printStack() {
 		log.Errorf("%v", stack)
 	}
 	log.Errorf("Fatal: end of stacks")
-	RebootReason(fmt.Sprintf("fatal: agent %s[%d] exit", savedAgentName, savedPid),
-		false)
-	RebootStack(stacks)
+	RebootReason(fmt.Sprintf("fatal: agent %s[%d] exit", agentName, agentPid),
+		agentName, agentPid, false)
+	RebootStack(stacks, agentName, agentPid)
 }
 
 // RebootReason writes a reason string in /persist/reboot-reason, including agentName and date
 // It also appends to /persist/log/reboot-reason.log
 // NOTE: can not use log here since we are called from a log hook!
-func RebootReason(reason string, normal bool) {
-	// NOTE: can not use log here since we are called from a log hook!
-	fmt.Printf("RebootReason(%s)", reason)
+func RebootReason(reason string, agentName string, agentPid int, normal bool) {
 	filename := fmt.Sprintf("%s/%s", types.PersistDir, reasonFile)
 	dateStr := time.Now().Format(time.RFC3339Nano)
 	if !normal {
-		reason = fmt.Sprintf("Reboot from agent %s[%d] in partition %s at %s: %s\n",
-			savedAgentName, savedPid, zboot.GetCurrentPartition(), dateStr, reason)
+		reason = fmt.Sprintf("Reboot from agent %s[%d] in partition %s EVE version %s at %s: %s\n",
+			agentName, agentPid, EveCurrentPartition(), EveVersion(), dateStr, reason)
+	} else {
+		reason = fmt.Sprintf("%s EVE version %s at %s\n",
+			reason, EveVersion(), dateStr)
 	}
 	err := printToFile(filename, reason)
 	if err != nil {
@@ -153,8 +180,21 @@ func RebootReason(reason string, normal bool) {
 		// Note: can not use log here since we are called from a log hook!
 		fmt.Printf("printToFile failed %s\n", err)
 	}
+
+	if !normal {
+		agentDebugDir := fmt.Sprintf("%s/%s/", types.PersistDebugDir,
+			agentName)
+
+		agentFatalReasonFilename := agentDebugDir + "/fatal-reason"
+		err = overWriteFile(agentFatalReasonFilename, reason)
+		if err != nil {
+			// Note: can not use log here since we are called from a log hook!
+			fmt.Printf("printToFile failed %s\n", err)
+		}
+	}
+
 	filename = "/persist/" + rebootImage
-	curPart := zboot.GetCurrentPartition()
+	curPart := EveCurrentPartition()
 	err = printToFile(filename, curPart)
 	if err != nil {
 		// Note: can not use log here since we are called from a log hook!
@@ -165,7 +205,7 @@ func RebootReason(reason string, normal bool) {
 
 // RebootStack writes stack in /persist/reboot-stack
 // and appends to /persist/log/reboot-stack.log
-func RebootStack(stacks string) {
+func RebootStack(stacks string, agentName string, agentPid int) {
 	filename := fmt.Sprintf("%s/%s", types.PersistDir, stackFile)
 	log.Warnf("RebootStack to %s", filename)
 	err := printToFile(filename, fmt.Sprintf("%v\n", stacks))
@@ -174,6 +214,12 @@ func RebootStack(stacks string) {
 	}
 	filename = "/persist/log/" + stackFile + ".log"
 	err = printToFile(filename, fmt.Sprintf("%v\n", stacks))
+	if err != nil {
+		log.Errorf("printToFile failed %s\n", err)
+	}
+	agentDebugDir := fmt.Sprintf("%s/%s/", types.PersistDebugDir, agentName)
+	agentStackTraceFile := agentDebugDir + "/fatal-stack"
+	err = overWriteFile(agentStackTraceFile, fmt.Sprintf("%v\n", stacks))
 	if err != nil {
 		log.Errorf("printToFile failed %s\n", err)
 	}
@@ -238,6 +284,20 @@ func printToFile(filename string, str string) error {
 	return nil
 }
 
+// Overwrite if file exists.
+func overWriteFile(filename string, str string) error {
+	f, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0755)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(str)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func DiscardOtherRebootReason() {
 	dirname := getOtherIMGdir(false)
 	if dirname == "" {
@@ -249,7 +309,7 @@ func DiscardOtherRebootReason() {
 		log.Errorf("DiscardOtherRebootReason failed %s\n", err)
 	}
 	_, err := os.Stat(stackFilename)
-	if err != nil {
+	if err == nil {
 		if err := os.Remove(stackFilename); err != nil {
 			log.Errorf("DiscardOtherRebootReason failed %s\n", err)
 		}
@@ -263,7 +323,7 @@ func DiscardCommonRebootReason() {
 		log.Errorf("DiscardCommonRebootReason failed %s\n", err)
 	}
 	_, err := os.Stat(stackFilename)
-	if err != nil {
+	if err == nil {
 		if err := os.Remove(stackFilename); err != nil {
 			log.Errorf("DiscardCommonRebootReason failed %s\n", err)
 		}
@@ -300,23 +360,47 @@ func logGCStats() {
 	log.Infof("GCStats %+v\n", m)
 }
 
-// LogMemoryUsage provides for user-triggered memory reports
-func LogMemoryUsage() {
-	log.Info("User-triggered memory report")
-	logMemUsage()
-	logGCStats()
+// Print in sorted order based on top bytes
+func logMemAllocationSites(file *os.File) {
+	reportZeroInUse := false
+	numSites, sites := GetMemAllocationSites(reportZeroInUse)
+	log.Warnf("alloc %d sites len %d", numSites, len(sites))
+	sort.Slice(sites,
+		func(i, j int) bool {
+			return sites[i].InUseBytes > sites[j].InUseBytes ||
+				(sites[i].InUseBytes == sites[j].InUseBytes &&
+					sites[i].AllocBytes > sites[j].AllocBytes)
+		})
+	for _, site := range sites {
+		log.Warnf("alloc %d bytes %d objects total %d/%d at:\n%s",
+			site.InUseBytes, site.InUseObjects, site.AllocBytes,
+			site.AllocObjects, site.PrintedStack)
+
+		if file != nil {
+			// This goes to /persist/agentdebug/<agentname>/sigusr2 file
+			// And there in not much difference from the above log except the CRNL at the end.
+			statString := fmt.Sprintf("alloc %d bytes %d objects total %d/%d at:\n%s\n",
+				site.InUseBytes, site.InUseObjects, site.AllocBytes,
+				site.AllocObjects, site.PrintedStack)
+			file.WriteString(statString)
+		}
+	}
 }
 
-func logMemUsage() {
+func logMemUsage(file *os.File) {
 	var m runtime.MemStats
 
 	runtime.ReadMemStats(&m)
+	log.Infof("Alloc %d Mb, TotalAlloc %d Mb, Sys %d Mb, NumGC %d",
+		roundToMb(m.Alloc), roundToMb(m.TotalAlloc), roundToMb(m.Sys), m.NumGC)
 
-	log.Infof("Alloc %v Mb", roundToMb(m.Alloc))
-	log.Infof("TotalAlloc %v Mb", roundToMb(m.TotalAlloc))
-	log.Infof("Sys %v Mb", roundToMb(m.Sys))
-	log.Infof("NumGC %v", m.NumGC)
-	log.Infof("MemStats %+v", m)
+	if file != nil {
+		// This goes to /persist/agentdebug/<agentname>/sigusr2 file
+		// And there in not much difference from the above log except the CRNL at the end.
+		statString := fmt.Sprintf("Alloc %d Mb, TotalAlloc %d Mb, Sys %d Mb, NumGC %d\n",
+			roundToMb(m.Alloc), roundToMb(m.TotalAlloc), roundToMb(m.Sys), m.NumGC)
+		file.WriteString(statString)
+	}
 }
 
 func roundToMb(b uint64) uint64 {
@@ -326,32 +410,92 @@ func roundToMb(b uint64) uint64 {
 	return mb
 }
 
-func Init(agentName string, curpart string) error {
-	if curpart != "" {
-		zboot.SetCurpart(curpart)
+func touchFile(filename string) {
+	_, err := os.Stat(filename)
+	if os.IsNotExist(err) {
+		file, err := os.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_SYNC, 0755)
+		if err != nil {
+			log.Fatalf("touchFile: Failed touching file %s with err: %s", filename, err)
+		}
+		defer file.Close()
+	} else {
+		currentTime := time.Now()
+		err = os.Chtimes(filename, currentTime, currentTime)
+		if err != nil {
+			log.Fatalf("touchFile: Failed touching file %s with err: %s", filename, err)
+		}
 	}
-	logdir := GetCurrentLogdir()
-	savedAgentName = agentName
-	savedPid = os.Getpid()
-	return initImpl(agentName, logdir)
 }
 
-var currentIMGdir = ""
-
-func getCurrentIMGdir() string {
-
-	if currentIMGdir != "" {
-		return currentIMGdir
+func spoofStdFDs(agentName string) *os.File {
+	agentDebugDir := fmt.Sprintf("%s/%s/", types.PersistDebugDir, agentName)
+	if _, err := os.Stat(agentDebugDir); os.IsNotExist(err) {
+		// Create the agent specific debug directory
+		if err := os.MkdirAll(agentDebugDir, 0755); err != nil {
+			log.Fatalf("spoofStdFDs: Agent specific debug directory (%s) does not exist: %s",
+				agentDebugDir, err)
+		}
 	}
-	partName := zboot.GetCurrentPartition()
-	currentIMGdir = fmt.Sprintf("%s/%s", types.PersistDir, partName)
-	return currentIMGdir
+	startTimeFile := agentDebugDir + "/starttime"
+	touchFile(startTimeFile)
+
+	stdOutFile := agentDebugDir + "/stdout"
+	stdOut, err := os.OpenFile(stdOutFile, os.O_WRONLY|os.O_CREATE|os.O_SYNC, 0755)
+	if err != nil {
+		log.Fatalf("spoofStdFDs: Failed opening stdout file %s with err: %s", stdOutFile, err)
+	}
+
+	fd2, err := syscall.Dup(int(os.Stdout.Fd()))
+	if err != nil {
+		log.Fatalf("spoofStdFDs: Error duplicating Stdout: %s", err)
+	}
+	originalStdout, err := os.OpenFile(fmt.Sprintf("/dev/fd/%d", fd2),
+		os.O_WRONLY|os.O_CREATE|os.O_SYNC, 0755)
+	if err != nil {
+		log.Fatalf("spoofStdFDs: Error opening duplicate stdout with fd: %v", fd2)
+	}
+	// replace stdout
+	err = syscall.Dup3(int(stdOut.Fd()), 1, 0)
+	if err != nil {
+		log.Fatalf("spoofStdFDs: Error replacing stdout with panic file %s: %s",
+			stdOutFile, err)
+	}
+	return originalStdout
+}
+
+func Init(agentName string) {
+	agentPid := os.Getpid()
+	if once() {
+		log.SetOutput(os.Stdout)
+		originalStdout := spoofStdFDs(agentName)
+		log.SetOutput(originalStdout)
+		hook := new(FatalHook)
+		hook.agentName = agentName
+		hook.agentPid = agentPid
+		log.AddHook(hook)
+		hook2 := new(SourceHook)
+		hook2.agentName = agentName
+		hook2.agentPid = agentPid
+		log.AddHook(hook2)
+		// Report nano timestamps
+		formatter := log.JSONFormatter{
+			TimestampFormat: time.RFC3339Nano,
+		}
+		log.SetFormatter(&formatter)
+		log.SetReportCaller(true)
+
+		sigs := make(chan os.Signal, 1)
+		signal.Notify(sigs, syscall.SIGUSR1)
+		signal.Notify(sigs, syscall.SIGUSR2)
+		go handleSignals(agentName, agentPid, sigs)
+	}
+	eh := func() { printStack(agentName, agentPid) }
+	log.RegisterExitHandler(eh)
 }
 
 var otherIMGdir = ""
 
 func getOtherIMGdir(inprogressCheck bool) string {
-
 	if otherIMGdir != "" {
 		return otherIMGdir
 	}
@@ -363,31 +507,21 @@ func getOtherIMGdir(inprogressCheck bool) string {
 	return otherIMGdir
 }
 
-// Return a logdir for agents and logmanager to use by default
-func GetCurrentLogdir() string {
-	return fmt.Sprintf("%s/log", getCurrentIMGdir())
-}
-
-// If the other partition is not inprogress we return the empty string
-func GetOtherLogdir() string {
-	dirname := getOtherIMGdir(true)
-	if dirname == "" {
-		return ""
-	}
-	return fmt.Sprintf("%s/log", dirname)
-}
-
 // Debug info to tell how often/late we call stillRunning; keyed by agentName
-var lastStillMap = make(map[string]time.Time)
+var lockedLastStillMap = base.NewLockedStringMap()
 
 // Touch a file per agentName to signal the event loop is still running
 // Could be use by watchdog
 func StillRunning(agentName string, warnTime time.Duration, errTime time.Duration) {
 	log.Debugf("StillRunning(%s)\n", agentName)
 
-	if ls, found := lastStillMap[agentName]; !found {
-		lastStillMap[agentName] = time.Now()
+	if lsValue, found := lockedLastStillMap.Load(agentName); !found {
+		lockedLastStillMap.Store(agentName, time.Now())
 	} else {
+		ls, ok := lsValue.(time.Time)
+		if !ok {
+			log.Fatalf("Unexpected type from lockedLastStillMap: wanted time.Time, got %T", lsValue)
+		}
 		elapsed := time.Since(ls)
 		if elapsed > errTime {
 			log.Errorf("StillRunning(%s) XXX took a long time: %d",
@@ -396,7 +530,7 @@ func StillRunning(agentName string, warnTime time.Duration, errTime time.Duratio
 			log.Warnf("StillRunning(%s) took a long time: %d",
 				agentName, elapsed/time.Second)
 		}
-		lastStillMap[agentName] = time.Now()
+		lockedLastStillMap.Store(agentName, time.Now())
 	}
 
 	filename := fmt.Sprintf("/var/run/%s.touch", agentName)

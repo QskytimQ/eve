@@ -12,10 +12,6 @@ import (
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/utils"
-	"github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
 	"io/ioutil"
 	"net"
 	"net/http"
@@ -25,6 +21,12 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/eriknordmark/netlink"
+	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/utils"
+	"github.com/satori/go.uuid"
+	log "github.com/sirupsen/logrus"
 )
 
 // XXX should we add some Init() function to create this?
@@ -40,6 +42,7 @@ type ZedCloudContext struct {
 	DevSoftSerial       string
 	NetworkSendTimeout  uint32 // In seconds
 	V2API               bool   // XXX Needed?
+	AgentName           string // the agent process name
 	// V2 related items
 	PrevCertPEM           [][]byte // cached proxy certs for later comparison
 	onBoardCert           *tls.Certificate
@@ -59,6 +62,7 @@ type ContextOptions struct {
 	Timeout          uint32
 	Serial           string
 	SoftSerial       string
+	AgentName        string
 }
 
 var sendCounter uint32
@@ -68,17 +72,19 @@ var nilUUID = uuid.UUID{}
 // ensure load spreading across multiple interfaces.
 // Returns response for first success. Caller can not use resp.Body but can
 // use []byte contents return.
+// If bailOnHTTPErr is set we immediately return when we get a 4xx or 5xx error without trying the other interfaces.
+// XXX also 1010 from CloudFlare?
 // We return a bool remoteTemporaryFailure for the cases when we reached
 // the controller but it is overloaded, or has certificate issues.
-func SendOnAllIntf(ctx *ZedCloudContext, url string, reqlen int64, b *bytes.Buffer, iteration int, return400 bool) (*http.Response, []byte, types.SenderResult, error) {
+func SendOnAllIntf(ctx *ZedCloudContext, url string, reqlen int64, b *bytes.Buffer, iteration int, bailOnHTTPErr bool) (*http.Response, []byte, types.SenderResult, error) {
 	// If failed then try the non-free
 	const allowProxy = true
 	var errorList []error
 	remoteTemporaryFailure := types.SenderStatusNone
 
+	var numFreeIntf int
 	for try := 0; try < 2; try += 1 {
 		var intfs []string
-		var numFreeIntf int
 		if try == 0 {
 			intfs = types.GetMgmtPortsFree(*ctx.DeviceNetworkStatus,
 				iteration)
@@ -109,8 +115,12 @@ func SendOnAllIntf(ctx *ZedCloudContext, url string, reqlen int64, b *bytes.Buff
 			if rtf != types.SenderStatusNone {
 				remoteTemporaryFailure = rtf
 			}
-			if return400 && resp != nil &&
-				resp.StatusCode == 400 {
+			if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
+				remoteTemporaryFailure = types.SenderStatusUpgrade
+			}
+
+			if bailOnHTTPErr && resp != nil &&
+				resp.StatusCode >= 400 && resp.StatusCode < 600 {
 				log.Infof("sendOnAllIntf: for %s reqlen %d ignore code %d\n",
 					url, reqlen, resp.StatusCode)
 				return resp, nil, remoteTemporaryFailure, err
@@ -128,21 +138,38 @@ func SendOnAllIntf(ctx *ZedCloudContext, url string, reqlen int64, b *bytes.Buff
 	return nil, nil, remoteTemporaryFailure, errors.New(errStr)
 }
 
-// We try with free interfaces first. If we find enough free interfaces through
+// VerifyAllIntf
+// We try with free interfaces in first iteration.
+//      We test interfaces in sequence and as soon as we find the first working
+//      interface, we stop. Other interfaces are not tested.
+// If we find enough free interfaces through
 // which cloud connectivity can be achieved, we won't test non-free interfaces.
 // Otherwise we test non-free interfaces also.
 // We return a bool remoteTemporaryFailure for the cases when we reached
 // the controller but it is overloaded, or has certificate issues.
+// Return Values:
+//    success/Failure, remoteTemporaryFailure, error, intfStatusMap
+//    If Failure,
+//       remoteTemporaryFailure - indicates if it is a remote failure
+//       error  - indicates details of Errors
+//    IntfStatusMap - This status for each interface verified.
+//      Includes entries for all interfaces that were tested.
+//      If an intf is success, Error == "" Else - Set to appropriate Error
+//      ErrorTime will always be set for the interface.
 func VerifyAllIntf(ctx *ZedCloudContext,
-	url string, successCount int, iteration int) (bool, bool, error) {
-	var intfSuccessCount int = 0
+	url string, successCount uint,
+	iteration int) (bool, bool, types.IntfStatusMap, error) {
+	var intfSuccessCount uint
 	const allowProxy = true
 	var errorList []error
+
 	remoteTemporaryFailure := false
+	// Map of per-interface errors
+	intfStatusMap := *types.NewIntfStatusMap()
 
 	if successCount <= 0 {
 		// No need to test. Just return true.
-		return true, remoteTemporaryFailure, nil
+		return true, remoteTemporaryFailure, intfStatusMap, nil
 	}
 
 	for try := 0; try < 2; try += 1 {
@@ -164,18 +191,24 @@ func VerifyAllIntf(ctx *ZedCloudContext,
 			// This VerifyAllIntf() is called for "ping" url only, it does not have
 			// return envelope verifying check. Thus below does not check other values of rtf.
 			resp, _, rtf, err := SendOnIntf(ctx, url, intf, 0, nil, allowProxy)
-			if rtf == types.SenderStatusRemTempFail {
+			switch rtf {
+			case types.SenderStatusRefused, types.SenderStatusCertInvalid:
+				remoteTemporaryFailure = true
+			}
+			if resp != nil && resp.StatusCode == http.StatusServiceUnavailable {
 				remoteTemporaryFailure = true
 			}
 			if err != nil {
 				log.Errorf("Zedcloud un-reachable via interface %s: %s",
 					intf, err)
 				errorList = append(errorList, err)
+				intfStatusMap.RecordFailure(intf, err.Error())
 				continue
 			}
 			switch resp.StatusCode {
 			case http.StatusOK, http.StatusCreated:
 				log.Debugf("VerifyAllIntf: Zedcloud reachable via interface %s", intf)
+				intfStatusMap.RecordSuccess(intf)
 				intfSuccessCount += 1
 			default:
 				errStr := fmt.Sprintf("Uplink test FAILED via %s to URL %s with "+
@@ -184,6 +217,7 @@ func VerifyAllIntf(ctx *ZedCloudContext,
 				log.Errorln(errStr)
 				err = errors.New(errStr)
 				errorList = append(errorList, err)
+				intfStatusMap.RecordFailure(intf, err.Error())
 				continue
 			}
 		}
@@ -192,15 +226,17 @@ func VerifyAllIntf(ctx *ZedCloudContext,
 		errStr := fmt.Sprintf("All test attempts to connect to %s failed: %v",
 			url, errorList)
 		log.Errorln(errStr)
-		return false, remoteTemporaryFailure, errors.New(errStr)
+		return false, remoteTemporaryFailure, intfStatusMap, errors.New(errStr)
 	}
 	if intfSuccessCount < successCount {
-		errStr := fmt.Sprintf("Not enough Ports (%d) against required count %d to reach Zedcloud; last failed with %v",
+		errStr := fmt.Sprintf("Not enough Ports (%d) against required count %d"+
+			" to reach Zedcloud; last failed with %v",
 			intfSuccessCount, successCount, errorList)
 		log.Errorln(errStr)
-		return false, remoteTemporaryFailure, errors.New(errStr)
+		return false, remoteTemporaryFailure, intfStatusMap, errors.New(errStr)
 	}
-	return true, remoteTemporaryFailure, nil
+	log.Debugf("VerifyAllIntf: Verify done. intfStatusMap: %+v", intfStatusMap)
+	return true, remoteTemporaryFailure, intfStatusMap, nil
 }
 
 // Tries all source addresses on interface until one succeeds.
@@ -213,7 +249,7 @@ func VerifyAllIntf(ctx *ZedCloudContext,
 func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64, b *bytes.Buffer, allowProxy bool) (*http.Response, []byte, types.SenderResult, error) {
 
 	var reqUrl string
-	var useTLS, isEdgenode, ishttpGet, useOnboard, isCerts bool
+	var useTLS, isEdgenode, isGet, useOnboard, isCerts bool
 
 	senderStatus := types.SenderStatusNone
 	if strings.HasPrefix(destURL, "http:") {
@@ -230,14 +266,14 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 
 	if strings.Contains(destURL, "/edgedevice/") {
 		isEdgenode = true
-		if strings.Contains(destURL, "/ping") {
-			ishttpGet = true
-		} else if strings.Contains(destURL, "/certs") {
-			ishttpGet = true
+		if strings.Contains(destURL, "/certs") {
 			isCerts = true
 		} else if strings.Contains(destURL, "/register") {
 			useOnboard = true
 		}
+	}
+	if b == nil {
+		isGet = true
 	}
 
 	addrCount := types.CountLocalAddrAnyNoLinkLocalIf(*ctx.DeviceNetworkStatus, intf)
@@ -247,6 +283,21 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 	if addrCount == 0 {
 		if ctx.FailureFunc != nil {
 			ctx.FailureFunc(intf, reqUrl, 0, 0, false)
+		}
+		// Determine a specific failure for intf
+		link, err := netlink.LinkByName(intf)
+		if err != nil {
+			errStr := fmt.Sprintf("Link not found to connect to %s using intf %s: %s",
+				reqUrl, intf, err)
+			log.Debugln(errStr)
+			return nil, nil, senderStatus, errors.New(errStr)
+		}
+		attrs := link.Attrs()
+		if attrs.OperState != netlink.OperUp {
+			errStr := fmt.Sprintf("Link not up to connect to %s using intf %s: %s",
+				reqUrl, intf, attrs.OperState.String())
+			log.Debugln(errStr)
+			return nil, nil, senderStatus, errors.New(errStr)
 		}
 		errStr := fmt.Sprintf("No IP addresses to connect to %s using intf %s",
 			reqUrl, intf)
@@ -317,7 +368,7 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 
 		var req *http.Request
 		var b2 *bytes.Buffer
-		if ctx.V2API && isEdgenode && !ishttpGet {
+		if ctx.V2API && isEdgenode && !isGet {
 			b2, err = addAuthentication(ctx, b, useOnboard)
 			if err != nil {
 				log.Errorf("SendOnIntf: auth error %v\n", err)
@@ -342,13 +393,11 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 		if b2 != nil {
 			req.Header.Add("Content-Type", "application/x-proto-binary")
 		}
-		// Add Device UUID to the HTTP Header
-		// for tracability
-		devUuidStr := ctx.DevUUID.String()
-		if devUuidStr != "" && devUuidStr != nilUUID.String() {
-			req.Header.Add("X-Request-Id", devUuidStr)
-		} else {
-			// Add Device Serial Number to the HTTP Header for initial tracability
+		// Add a per-request UUID to the HTTP Header
+		// for tracability in the controller
+		req.Header.Add("X-Request-Id", uuid.NewV4().String())
+		if ctx.DevUUID == nilUUID {
+			// Also add Device Serial Number to the HTTP Header for initial tracability
 			devSerialNum := ctx.DevSerial
 			if devSerialNum != "" {
 				req.Header.Add("X-Serial-Number", devSerialNum)
@@ -359,7 +408,7 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 				req.Header.Add("X-Soft-Serial", devSoftSerial)
 			}
 			log.Debugf("Serial-Numbers, count (%d), serial: %s, soft-serial %s",
-				sendCounter, devSerialNum, devSoftSerial) // XXX change to debug
+				sendCounter, devSerialNum, devSoftSerial)
 			sendCounter++
 		}
 
@@ -379,14 +428,14 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(),
 			trace))
 		log.Debugf("SendOnIntf: req method %s, isget %v, url %s",
-			req.Method, ishttpGet, reqUrl)
+			req.Method, isGet, reqUrl)
 		resp, err := client.Do(req)
 		if err != nil {
 			if cf, cert := isCertFailure(err); cf {
 				// XXX can we ever get this from a proxy?
 				// We assume we reached the controller here
 				log.Errorf("client.Do fail: certFailure")
-				senderStatus = types.SenderStatusRemTempFail
+				senderStatus = types.SenderStatusCertInvalid
 				if cert != nil {
 					errStr := fmt.Sprintf("cert failure for Subject %s NotBefore %v NotAfter %v",
 						cert.Subject, cert.NotBefore,
@@ -408,10 +457,12 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 				errorList = append(errorList, err)
 			} else if isECONNREFUSED(err) {
 				if usedProxy {
+					// Must try other interfaces and configs
+					// since the proxy might be broken.
 					log.Errorf("client.Do fail: ECONNREFUSED with proxy")
 				} else {
 					log.Errorf("client.Do fail: ECONNREFUSED")
-					senderStatus = types.SenderStatusRemTempFail
+					senderStatus = types.SenderStatusRefused
 				}
 				errorList = append(errorList, err)
 			} else if isNoSuitableAddress(err) {
@@ -530,7 +581,10 @@ func SendOnIntf(ctx *ZedCloudContext, destURL string, intf string, reqlen int64,
 			errStr := fmt.Sprintf("SendOnIntf to %s reqlen %d statuscode %d %s",
 				reqUrl, reqlen, resp.StatusCode,
 				http.StatusText(resp.StatusCode))
-			log.Errorln(errStr)
+			// zedrouter probing sends 'http' to zedcloud server, expect to get status of 404, not an error
+			if resp.StatusCode != http.StatusNotFound || ctx.AgentName != "zedrouter" {
+				log.Errorln(errStr)
+			}
 			log.Debugf("received response %v\n", resp)
 			// Get caller to schedule a retry based on StatusCode
 			return resp, nil, types.SenderStatusNone, errors.New(errStr)
@@ -614,6 +668,7 @@ func NewContext(opt ContextOptions) ZedCloudContext {
 		V2API:               UseV2API(),
 		DevSerial:           opt.Serial,
 		DevSoftSerial:       opt.SoftSerial,
+		AgentName:           opt.AgentName,
 	}
 	if opt.NeedStatsFunc {
 		ctx.FailureFunc = ZedCloudFailure

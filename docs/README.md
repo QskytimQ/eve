@@ -9,6 +9,7 @@
 1. [Runtime Lifecycle](#runtime-lifecycle)
 1. [Building EVE](#building-eve)
 1. [EVE Internals](#eve-internals)
+1. [EVE CGroups](#eve-cgroups)
 
 ## Introduction
 
@@ -121,7 +122,7 @@ A good way to think about this is that Controller is to EVE what Kubernetes is
 to Docker Engine.
 
 An API between EVE and its Controller is considered a [public API of Project EVE](../api).
-Refer to [API documentation](../api/API.md) for detailed information on API
+Refer to [API documentation](../api/APIv2.md) for detailed information on API
 end points and message format.
 
 EVE design makes the trust between an EVE instance and its controller extremely
@@ -144,7 +145,7 @@ URL for the Controller and its Root x509 certificate are made available during
 
 ## Runtime Configuration
 
-The heart of EVE API is a self-contained [configuration object](../api/API.md#configuration)
+The heart of EVE API is a self-contained [configuration object](../api/APIv2.md#configuration)
 that each instance of EVE receives from its controller. This object is
 serialized into a protobuf message but it can also be represented as a JSON.
 It is self-contained in a sense that a running EVE instance doesn't need to
@@ -192,8 +193,7 @@ implementation would simply be able to consume exactly the same protobuf encoded
 binary blob that it receives from the Controller, currently we still have to
 rely on an ad-hoc collection of configuration files that serve the same purpose.
 We expect these configuration files to go away relatively quickly, but for now
-EVE is still stuck with at least *DevicePortConfig/global.json* and
-*GlobalConfig/global.json* and they are documented in [legacy configuration](CONFIG.md).
+EVE is still stuck with at least *DevicePortConfig/global.json* and it is documented in [legacy configuration](CONFIG.md).
 See [the following FAQ entry](FAQ.md) for how to manage both of these
 legacy files.
 
@@ -225,11 +225,6 @@ always start with debug.*microservice*.
 
 You can find a complete list of generic and microservices specific configuration
 properties in [configuration properties table](CONFIG-PROPERTIES.md).
-
-It goes without saying that runtime configuration properties can also be
-delivered out-of-band just like any other part of the EVE's configuration
-object. While in transition from legacy configuration files, you will have
-to use [GlobalConfig/global.json](FAQ.md) to make them available to EVE.
 
 ## Installing EVE on Edge Nodes
 
@@ -292,25 +287,25 @@ experience and they are described in greater details below.
 
 ## Runtime Lifecycle
 
-EVE boots as any traditional operating system that supports UEFI.
-EVE's boot process starts with UEFI firmware executing the GRUB trampoline
-that resides in GPT entry called ```EFI System```. This instance of GRUB is
-the only component that can *not* be changed after the initial installation
-of EVE on an Edge Node and as a result it is kept extremely simple. The only
-role that a GRUB trampoline [plays](../pkg/mkimage-raw-efi/efi-files/EFI/BOOT/grub.cfg)
-is selecting whether to chainload second stage GRUB from IMGA or IMGB partitions.
+EVE can be booted in a lot of different ways. The most common one is
+booting EVE in UEFI environment. However, booting with legacy PC BIOS
+and board specific firmware implementations (most commonly CoreBoot and
+u-boot) is also possible. In all of these scenarios, we rely on GRUB
+bootloader to figure out an active partition (either on IMGA or IMGB)
+and do all the necessary steps to boot EVE residing in an active partition.
 
-Second stage GRUB is expected to do all the [heavy lifting](../pkg/grub/rootfs.cfg)
-of actually booting an EVE instance and because it resides in IMGA or IMGB
-partitions it can easily be upgraded and patched. Behavior of this stage of
-boot process is controlled by a read-only grub.cfg under {IMGA,IMGB}/EFI/BOOT/
-but it can further be tweaked by the grub.cfg overrides on the CONFIG partition.
-Note that an override grub.cfg is expected to be a [complete override](../pkg/grub/rootfs.cfg#L132)
-and anyone constructing its content is expected to be familiar with the overall
-flow of read-only grub.cfg.
+Because of how heterogenous all these initial boot environments are,
+EVE uses a number of techniques to maintain a single image that can
+be booted in a variety of different scenarious. You can read about this
+in greater details in the [booting EVE](BOOTING.md) section of our docs.
 
-After second stage GRUB is done loading type-1 hypervisor and Control Domain
-kernel the rest of the runtime sequence relies solely on what happens with EVE
+Regardless of the initial boot environment, though, after GRUB is done
+loading ether:
+
+* type-1 hypervisor (Xen, ACRN) plus Control Domain kernel
+* Linux kernel (with type-2 KVM hypervisor support enabled)
+
+the rest of the runtime sequence relies solely on what happens with EVE
 microservices. All of these services are available under */containers/services*
 folder in IMGA or IMGB root filesystem. Their lifecycle is currently managed
 by [linuxkit init system](https://github.com/linuxkit/linuxkit/tree/master/pkg/init)
@@ -343,3 +338,45 @@ For some of the details on EVE internals you may want to check out:
 
 * [Domain Manager](../pkg/pillar/docs/domainmgr.md)
 * [TPM Manager](../pkg/pillar/docs/tpmmgr.md)
+
+## EVE CGroups
+
+Resources like memory and CPU used by EVE services, containerd, memlogd and edge applications are controlled by their respective [CGroups](https://www.kernel.org/doc/Documentation/cgroup-v2.txt).
+CGroups in EVE follows the below hierarchy:
+
+```text
+Parent cgroup (/sys/fs/cgroup/<subsystems>/)
+├── eve
+│   └── services
+│   │   └── rsyslogd
+│   │   └── ntpd
+│   │   └── sshd
+│   │   └── wwan
+│   │   └── wlan
+│   │   └── lisp
+│   │   └── guacd
+│   │   └── pillar
+│   │   └── vtpm
+│   │   └── watchdog
+│   │   └── xen-tools
+│   │
+│   └── containerd
+│   └── memlogd
+│
+└── eve-user-apps
+    └── (edge applications)
+```
+
+Memory and CPU limits of `eve`, `eve/services` and `eve/containerd` cgroups can be changed via
+`hv_dom0_*`, `hv_eve_*` and `hv_ctrd_*` respectively in `/config/grup.cfg`.
+
+Example:
+
+```text
+set_global hv_dom0_mem_settings "dom0_mem=800M,max:800M"
+set_global hv_dom0_cpu_settings "dom0_max_vcpus=1 dom0_vcpus_pin"
+set_global hv_eve_mem_settings "eve_mem=500M,max:500M"
+set_global hv_eve_cpu_settings "eve_max_vcpus=1"
+set_global hv_ctrd_mem_settings "ctrd_mem=250M,max:250M"
+set_global hv_ctrd_cpu_settings "ctrd_max_vcpus=1"
+```

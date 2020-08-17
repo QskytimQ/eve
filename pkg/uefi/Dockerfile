@@ -19,14 +19,21 @@ FROM ${BUILD_CONTAINER} as build
 # hadolint ignore=DL3018
 RUN apk add --no-cache curl make gcc g++ python libuuid iasl nasm util-linux-dev bash git util-linux
 
-RUN git clone --depth 1 -b edk2-stable201908 https://github.com/tianocore/edk2.git /ws
+RUN git clone --depth 1 -b edk2-stable202005 https://github.com/tianocore/edk2.git /ws
 WORKDIR /ws
-RUN git submodule update --init --depth 1
+RUN git submodule update --init
 COPY build.sh /ws/
 COPY patch /ws/patch
 RUN bash -c 'patch -p0 < patch/*'
 RUN make -C BaseTools
 RUN ./build.sh
 
+# now create an out dir for all the artifacts
+RUN mkdir /out && cp /ws/OVMF*.fd /out
+
+# FIXME: we should be building Raspbery Pi 4 UEFI implementations
+COPY rpi /tmp/rpi
+RUN if [ "$(uname -m)" = aarch64 ]; then cp -r /tmp/rpi /out/ ;fi
+
 FROM scratch
-COPY --from=build /ws/OVMF*.fd /
+COPY --from=build /out/* /

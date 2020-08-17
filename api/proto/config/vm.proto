@@ -4,8 +4,9 @@
 
 syntax = "proto3";
 
+package org.lfedge.eve.config;
 option go_package = "github.com/lf-edge/eve/api/go/config";
-option java_package = "com.zededa.cloud.uservice.proto";
+option java_package = "org.lfedge.eve.config";
 
 // For now we need to tell the device which virtualization mode
 // to use. Later we might use a single one for all VMs (on any particular
@@ -16,6 +17,7 @@ enum VmMode {
   HVM = 1;
   Filler = 2; // PVH = 2;
   FML = 3; // Experimental machine learning mode
+  NOHYPER = 4; // Do not use a hypervisor
 }
 
 message VmConfig {

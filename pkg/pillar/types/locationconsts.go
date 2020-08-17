@@ -1,4 +1,4 @@
-// Copyright (c) 2019 Zededa, Inc.
+// Copyright (c) 2019,2020 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
 package types
@@ -11,16 +11,20 @@ const (
 	PersistDir = "/persist"
 	// PersistConfigDir is where we keep some configuration across reboots
 	PersistConfigDir = PersistDir + "/config"
-	// DownloadDirname - Location of downloaded images / objects
-	DownloadDirname = PersistDir + "/downloads"
+	// PersistStatusDir is where we keep some configuration across reboots
+	PersistStatusDir = PersistDir + "/status"
 	// CertificateDirname - Location of certificates
 	CertificateDirname = PersistDir + "/certs"
-	// AppImgDirname - location of downloaded app images. Read-only images
-	// named based on sha256 hash each in its own directory
-	AppImgDirname = DownloadDirname + "/" + AppImgObj
-	// VerifiedAppImgDirname - Location of verified App images. Read-only images
-	// named based on sha256 hash each in its own directory
-	VerifiedAppImgDirname = AppImgDirname + "/verified"
+	// SealedDirName - directory sealed under TPM PCRs
+	SealedDirName = PersistDir + "/vault"
+	// VolumeEncryptedDirName - sealed directory used to store volumes
+	VolumeEncryptedDirName = SealedDirName + "/volumes"
+	// ClearDirName - directory which is not encrypted
+	ClearDirName = PersistDir + "/clear"
+	// VolumeClearDirName - Not encrypted directory used to store volumes
+	VolumeClearDirName = ClearDirName + "/volumes"
+	// PersistDebugDir - Location for service specific debug/traces
+	PersistDebugDir = PersistDir + "/agentdebug"
 
 	// IdentityDirname - Config dir
 	IdentityDirname = "/config"
@@ -43,15 +47,21 @@ const (
 	// UUIDFileName - device UUID
 	UUIDFileName = IdentityDirname + "/uuid"
 
-	// APIV2FileName - user can statically allow for API v2
-	APIV2FileName = IdentityDirname + "/Force-API-V2"
+	// APIV1FileName - user can statically allow for API v1
+	APIV1FileName = IdentityDirname + "/Force-API-V1"
+
 	// ServerSigningCertFileName - filename for server signing leaf certificate
 	ServerSigningCertFileName = CertificateDirname + "/server-signing-cert.pem"
 
-	// AppImgObj - name of app image obj dir
+	// ShareCertDirname - directory to place private proxy server certificates
+	ShareCertDirname = "/usr/local/share/ca-certificates"
+
+	// AppImgObj - name of app image type
 	AppImgObj = "appImg.obj"
-	// BaseOsObj - name of base image obj dir
+	// BaseOsObj - name of base image type
 	BaseOsObj = "baseOs.obj"
-	// CertObj - Name of Certificate obj. dir
+	// CertObj - Name of Certificate type
 	CertObj = "cert.obj"
+	//ITokenFile contains the integrity token sent in attestation response
+	ITokenFile = "/var/run/eve.integrity_token"
 )

@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
@@ -27,10 +30,10 @@ func makeDownloadHandler() *downloadHandler {
 // Wrappers around createObject, modifyObject, and deleteObject
 
 // Determine whether it is an create or modify
-func (d *downloadHandler) modify(ctxArg interface{}, objType string,
+func (d *downloadHandler) modify(ctxArg interface{},
 	key string, configArg interface{}) {
 
-	log.Infof("downloadHandler.modify(%s)\n", key)
+	log.Infof("downloadHandler.modify(%s)", key)
 	config := configArg.(types.DownloaderConfig)
 	h, ok := d.handlers[config.Key()]
 	if !ok {
@@ -45,10 +48,10 @@ func (d *downloadHandler) modify(ctxArg interface{}, objType string,
 	}
 }
 
-func (d *downloadHandler) create(ctxArg interface{}, objType string,
+func (d *downloadHandler) create(ctxArg interface{},
 	key string, configArg interface{}) {
 
-	log.Infof("downloadHandler.create(%s)\n", key)
+	log.Infof("downloadHandler.create(%s)", key)
 	ctx := ctxArg.(*downloaderContext)
 	config := configArg.(types.DownloaderConfig)
 	h, ok := d.handlers[config.Key()]
@@ -57,7 +60,7 @@ func (d *downloadHandler) create(ctxArg interface{}, objType string,
 	}
 	h1 := make(chan Notify, 1)
 	d.handlers[config.Key()] = h1
-	go runHandler(ctx, objType, key, h1)
+	go runHandler(ctx, key, h1)
 	h = h1
 	select {
 	case h <- Notify{}:
@@ -71,16 +74,16 @@ func (d *downloadHandler) create(ctxArg interface{}, objType string,
 func (d *downloadHandler) delete(ctxArg interface{}, key string,
 	configArg interface{}) {
 
-	log.Infof("downloadHandler.delete(%s)\n", key)
+	log.Infof("downloadHandler.delete(%s)", key)
 	// Do we have a channel/goroutine?
 	h, ok := d.handlers[key]
 	if ok {
-		log.Debugf("Closing channel\n")
+		log.Debugf("Closing channel")
 		close(h)
 		delete(d.handlers, key)
 	} else {
-		log.Debugf("downloadHandler.delete: unknown %s\n", key)
+		log.Debugf("downloadHandler.delete: unknown %s", key)
 		return
 	}
-	log.Infof("downloadHandler.delete(%s) done\n", key)
+	log.Infof("downloadHandler.delete(%s) done", key)
 }

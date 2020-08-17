@@ -7,6 +7,7 @@ package zedcloud
 
 import (
 	"bytes"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/flextimer"
 	log "github.com/sirupsen/logrus"
 	"time"
@@ -24,11 +25,11 @@ import (
 // or AddDeferred to build a queue for each key
 
 type deferredItem struct {
-	buf         *bytes.Buffer
-	size        int64
-	url         string
-	zedcloudCtx ZedCloudContext
-	return400   bool
+	buf           *bytes.Buffer
+	size          int64
+	url           string
+	zedcloudCtx   ZedCloudContext
+	bailOnHTTPErr bool // Return 4xx and 5xx without trying other interfaces
 }
 
 type deferredItemList struct {
@@ -44,14 +45,19 @@ type DeferredContext struct {
 	ticker        flextimer.FlexTickerHandle
 }
 
+//To keep track of what all agents called InitDeferred()
+var initDeferredAccessed = base.NewLockedStringMap()
+
 // From first InitDeferred
 var defaultCtx *DeferredContext
 
 // Create and return a channel to the caller
-func InitDeferred() <-chan time.Time {
-	if defaultCtx != nil {
-		log.Fatal("InitDeferred called twice")
+func InitDeferred(agentName string) <-chan time.Time {
+	if _, found := initDeferredAccessed.Load(agentName); found {
+		log.Fatalf("InitDeferred called twice by %s", agentName)
+
 	}
+	initDeferredAccessed.Store(agentName, nil)
 	defaultCtx = initImpl()
 	return defaultCtx.ticker.C
 }
@@ -98,9 +104,9 @@ func (ctx *DeferredContext) handleDeferred(event time.Time,
 			log.Infof("Trying to send for %s item %d data size %d\n",
 				key, i, item.size)
 			resp, _, _, err := SendOnAllIntf(&item.zedcloudCtx, item.url,
-				item.size, item.buf, iteration, item.return400)
-			if item.return400 && resp != nil &&
-				resp.StatusCode == 400 {
+				item.size, item.buf, iteration, item.bailOnHTTPErr)
+			if item.bailOnHTTPErr && resp != nil &&
+				resp.StatusCode >= 400 && resp.StatusCode < 600 {
 				log.Infof("HandleDeferred: for %s ignore code %d\n",
 					key, resp.StatusCode)
 			} else if err != nil {
@@ -172,17 +178,21 @@ func (ctx *DeferredContext) removeDeferred(key string) {
 }
 
 // Replace any item for the specified key. If timer not running start it
+// SetDeferred uses the key for identifying the channel. Please note that
+// for deviceUUID key is used for attestUrl, which is not the same for
+// other Urls, where in other caes, the key is very specific for the object
+//  and object type
 func SetDeferred(key string, buf *bytes.Buffer, size int64, url string,
-	zedcloudCtx ZedCloudContext, return400 bool) {
+	zedcloudCtx ZedCloudContext, bailOnHTTPErr bool) {
 
 	if defaultCtx == nil {
 		log.Fatal("SetDeferred no defaultCtx")
 	}
-	defaultCtx.setDeferred(key, buf, size, url, zedcloudCtx, return400)
+	defaultCtx.setDeferred(key, buf, size, url, zedcloudCtx, bailOnHTTPErr)
 }
 
 func (ctx *DeferredContext) setDeferred(key string, buf *bytes.Buffer,
-	size int64, url string, zedcloudCtx ZedCloudContext, return400 bool) {
+	size int64, url string, zedcloudCtx ZedCloudContext, bailOnHTTPErr bool) {
 
 	log.Infof("SetDeferred(%s) size %d map %d\n",
 		key, size, len(ctx.deferredItems))
@@ -196,11 +206,11 @@ func (ctx *DeferredContext) setDeferred(key string, buf *bytes.Buffer,
 		log.Debugf("Adding key %s\n", key)
 	}
 	item := deferredItem{
-		buf:         buf,
-		size:        size,
-		url:         url,
-		zedcloudCtx: zedcloudCtx,
-		return400:   return400,
+		buf:           buf,
+		size:          size,
+		url:           url,
+		zedcloudCtx:   zedcloudCtx,
+		bailOnHTTPErr: bailOnHTTPErr,
 	}
 	l := deferredItemList{}
 	l.list = append(l.list, item)
@@ -209,16 +219,16 @@ func (ctx *DeferredContext) setDeferred(key string, buf *bytes.Buffer,
 
 // Add to slice for this key
 func AddDeferred(key string, buf *bytes.Buffer, size int64, url string,
-	zedcloudCtx ZedCloudContext, return400 bool) {
+	zedcloudCtx ZedCloudContext, bailOnHTTPErr bool) {
 
 	if defaultCtx == nil {
 		log.Fatal("SetDeferred no defaultCtx")
 	}
-	defaultCtx.addDeferred(key, buf, size, url, zedcloudCtx, return400)
+	defaultCtx.addDeferred(key, buf, size, url, zedcloudCtx, bailOnHTTPErr)
 }
 
 func (ctx *DeferredContext) addDeferred(key string, buf *bytes.Buffer,
-	size int64, url string, zedcloudCtx ZedCloudContext, return400 bool) {
+	size int64, url string, zedcloudCtx ZedCloudContext, bailOnHTTPErr bool) {
 
 	log.Infof("AddDeferred(%s) size %d map %d\n", key,
 		size, len(ctx.deferredItems))
@@ -232,11 +242,11 @@ func (ctx *DeferredContext) addDeferred(key string, buf *bytes.Buffer,
 		log.Debugf("Adding key %s\n", key)
 	}
 	item := deferredItem{
-		buf:         buf,
-		size:        size,
-		url:         url,
-		zedcloudCtx: zedcloudCtx,
-		return400:   return400,
+		buf:           buf,
+		size:          size,
+		url:           url,
+		zedcloudCtx:   zedcloudCtx,
+		bailOnHTTPErr: bailOnHTTPErr,
 	}
 	l.list = append(l.list, item)
 	ctx.deferredItems[key] = l

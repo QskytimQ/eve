@@ -12,7 +12,6 @@ import (
 	"fmt"
 	uuid "github.com/satori/go.uuid"
 	"net"
-	"os"
 	"strconv"
 	"strings"
 
@@ -20,6 +19,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/devicenetwork"
 	"github.com/lf-edge/eve/pkg/pillar/iptables"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/wrap"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -78,7 +78,7 @@ func checkPortAvailable(
 		if isSharedPortLabel(status.CurrentUplinkIntf) {
 			errStr := fmt.Sprintf("SharedPortLabel %s not allowed for exclusive network instance %s-%s\n",
 				status.CurrentUplinkIntf, status.Key(), status.DisplayName)
-			log.Errorln(errStr)
+			log.Error(errStr)
 			return errors.New(errStr)
 		}
 	}
@@ -140,22 +140,21 @@ func checkPortAvailable(
 	return nil
 }
 
-func isOverlay(netType types.NetworkInstanceType) bool {
-	if netType == types.NetworkInstanceTypeMesh {
-		return true
+func disableIcmpRedirects(bridgeName string) {
+	sysctlSetting := fmt.Sprintf("net.ipv4.conf.%s.send_redirects=0", bridgeName)
+	args := []string{"-w", sysctlSetting}
+	out, err := wrap.Command("sysctl", args...).CombinedOutput()
+	if err != nil {
+		errStr := fmt.Sprintf("sysctl command %s failed %s output %s",
+			args, err, out)
+		log.Errorln(errStr)
 	}
-	return false
 }
 
 // doCreateBridge
 //		returns (error, bridgeMac-string)
 func doCreateBridge(bridgeName string, bridgeNum int,
 	status *types.NetworkInstanceStatus) (error, string) {
-	Ipv4Eid := false
-	if isOverlay(status.Type) && status.Subnet.IP != nil {
-		Ipv4Eid = (status.Subnet.IP.To4() != nil)
-		status.Ipv4Eid = Ipv4Eid
-	}
 
 	// Start clean
 	// delete the bridge
@@ -190,6 +189,7 @@ func doCreateBridge(bridgeName string, bridgeNum int,
 			bridgeName, err)
 		return errors.New(errStr), ""
 	}
+	disableIcmpRedirects(bridgeName)
 
 	// For the case of Lisp/Vpn networks, we route all traffic coming from
 	// the bridge to a dummy interface with MTU 1280. This is done to
@@ -331,25 +331,6 @@ func doBridgeAclsDelete(
 	for _, ans := range items {
 		appNetStatus := ans.(types.AppNetworkStatus)
 
-		for _, olStatus := range appNetStatus.OverlayNetworkList {
-			if olStatus.Network != status.UUID {
-				continue
-			}
-			if olStatus.Bridge == "" {
-				continue
-			}
-			log.Infof("NetworkInstance - deleting Acls for OL Interface(%s)",
-				olStatus.Name)
-			aclArgs := types.AppNetworkACLArgs{IsMgmt: false, BridgeName: olStatus.Bridge,
-				VifName: olStatus.Vif, BridgeIP: olStatus.BridgeIPAddr, AppIP: olStatus.EID.String(),
-				UpLinks: status.IfNameList}
-			ruleList, err := deleteACLConfiglet(aclArgs, olStatus.ACLRules)
-			if err != nil {
-				log.Errorf("doNetworkDelete ACL failed: %s\n",
-					err)
-			}
-			olStatus.ACLRules = ruleList
-		}
 		for _, ulStatus := range appNetStatus.UnderlayNetworkList {
 			if ulStatus.Network != status.UUID {
 				continue
@@ -424,7 +405,8 @@ func handleNetworkInstanceCreate(
 	if err != nil {
 		log.Errorf("doNetworkInstanceCreate(%s) failed: %s\n",
 			key, err)
-		status.SetError(err)
+		log.Error(err)
+		status.SetErrorNow(err.Error())
 		status.ChangeInProgress = types.ChangeInProgressTypeNone
 		publishNetworkInstanceStatus(ctx, &status)
 		return
@@ -436,7 +418,8 @@ func handleNetworkInstanceCreate(
 		err := doNetworkInstanceActivate(ctx, &status)
 		if err != nil {
 			log.Errorf("doNetworkInstanceActivate(%s) failed: %s\n", key, err)
-			status.SetError(err)
+			log.Error(err)
+			status.SetErrorNow(err.Error())
 		} else {
 			log.Infof("Activated network instance %s %s", status.UUID, status.DisplayName)
 			status.Activated = true
@@ -562,6 +545,12 @@ func doNetworkInstanceSanityCheck(
 
 	log.Infof("Sanity Checking NetworkInstance(%s-%s): type:%d, IpType:%d\n",
 		status.DisplayName, status.UUID, status.Type, status.IpType)
+
+	err := checkNIphysicalPort(ctx, status)
+	if err != nil {
+		log.Error(err)
+		return err
+	}
 
 	//  Check NetworkInstanceType
 	switch status.Type {
@@ -703,15 +692,24 @@ func doNetworkInstanceModify(ctx *zedrouterContext,
 	if config.Type != status.Type {
 		log.Infof("doNetworkInstanceModify: key %s\n", config.UUID)
 		// We do not allow Type to change.
-		status.SetError(
-			errors.New("Changing Type of NetworkInstance is not supported"))
+
+		err := fmt.Errorf("Changing Type of NetworkInstance from %d to %d is not supported", status.Type, config.Type)
+		log.Error(err)
+		status.SetErrorNow(err.Error())
+	}
+
+	err := checkNIphysicalPort(ctx, status)
+	if err != nil {
+		log.Error(err)
+		status.SetErrorNow(err.Error())
+		return
 	}
 
 	if config.Logicallabel != status.Logicallabel {
 		err := fmt.Errorf("Changing Logicallabel in NetworkInstance is not yet supported: from %s to %s",
 			status.Logicallabel, config.Logicallabel)
 		log.Error(err)
-		status.SetError(err)
+		status.SetErrorNow(err.Error())
 		return
 	}
 
@@ -720,7 +718,8 @@ func doNetworkInstanceModify(ctx *zedrouterContext,
 		if err != nil {
 			log.Errorf("doNetworkInstanceActivate(%s) failed: %s\n",
 				config.Key(), err)
-			status.SetError(err)
+			log.Error(err)
+			status.SetErrorNow(err.Error())
 		} else {
 			status.Activated = true
 		}
@@ -728,6 +727,21 @@ func doNetworkInstanceModify(ctx *zedrouterContext,
 		doNetworkInstanceInactivate(ctx, status)
 		status.Activated = false
 	}
+}
+
+func checkNIphysicalPort(ctx *zedrouterContext, status *types.NetworkInstanceStatus) error {
+	// check the NI have the valid physical port binding to
+	label := status.Logicallabel
+	if label != "" && !strings.EqualFold(label, "uplink") &&
+		!strings.EqualFold(label, "freeuplink") {
+		ifname := types.LogicallabelToIfName(ctx.deviceNetworkStatus, label)
+		devPort := ctx.deviceNetworkStatus.GetPortByIfName(ifname)
+		if devPort == nil {
+			err := fmt.Sprintf("Network Instance port %s does not exist", label)
+			return errors.New(err)
+		}
+	}
+	return nil
 }
 
 // getSwitchNetworkInstanceUsingIfname
@@ -892,7 +906,7 @@ func releaseIPv4FromNetworkInstance(ctx *zedrouterContext,
 	if _, ok := status.IPAssignments[mac.String()]; !ok {
 		errStr := fmt.Sprintf("releaseIPv4: not found %s for %s",
 			mac.String(), status.Key())
-		log.Errorln(errStr)
+		log.Error(errStr)
 		return errors.New(errStr)
 	}
 	delete(status.IPAssignments, mac.String())
@@ -1157,8 +1171,6 @@ func doNetworkInstanceActivate(ctx *zedrouterContext,
 		err = natActivate(ctx, status)
 	case types.NetworkInstanceTypeCloud:
 		err = vpnActivate(ctx, status)
-	case types.NetworkInstanceTypeMesh:
-		err = lispActivate(ctx, status)
 	default:
 		errStr := fmt.Sprintf("doNetworkInstanceActivate: NetworkInstance %d not yet supported",
 			status.Type)
@@ -1234,8 +1246,6 @@ func doNetworkInstanceInactivate(
 		natInactivate(ctx, status, false)
 	case types.NetworkInstanceTypeCloud:
 		vpnInactivate(ctx, status)
-	case types.NetworkInstanceTypeMesh:
-		lispInactivate(ctx, status)
 	}
 
 	return
@@ -1432,49 +1442,6 @@ func bridgeInactivateforNetworkInstance(ctx *zedrouterContext,
 		status.Logicallabel, ifname)
 }
 
-// ==== Lisp
-
-func lispActivate(ctx *zedrouterContext,
-	status *types.NetworkInstanceStatus) error {
-
-	log.Infof("lispActivate(%s)\n", status.DisplayName)
-
-	// Create Lisp IID & map-server configlets
-	iid := status.LispConfig.IID
-	mapServers := status.LispConfig.MapServers
-	cfgPathnameIID := lispRunDirname + "/" +
-		strconv.FormatUint(uint64(iid), 10)
-	file, err := os.Create(cfgPathnameIID)
-	if err != nil {
-		log.Errorf("lispActivate failed: %s ", err)
-		return err
-	}
-	defer file.Close()
-
-	// Write map-servers to configlet
-	for _, ms := range mapServers {
-		msConfigLine := fmt.Sprintf(lispMStemplate, iid,
-			ms.NameOrIp, ms.Credential)
-		file.WriteString(msConfigLine)
-	}
-
-	// Write Lisp IID template
-	iidConfig := fmt.Sprintf(lispIIDtemplate, iid)
-	file.WriteString(iidConfig)
-
-	if status.Ipv4Eid {
-		ipv4Network := status.Subnet.IP.Mask(status.Subnet.Mask)
-		maskLen, _ := status.Subnet.Mask.Size()
-		subnet := fmt.Sprintf("%s/%d",
-			ipv4Network.String(), maskLen)
-		file.WriteString(fmt.Sprintf(
-			lispIPv4IIDtemplate, iid, subnet))
-	}
-
-	log.Infof("lispActivate(%s)\n", status.DisplayName)
-	return nil
-}
-
 // ==== Nat
 
 // XXX need to redo this when MgmtPorts/FreeMgmtPorts changes?
@@ -1510,41 +1477,6 @@ func natActivate(ctx *zedrouterContext,
 		}
 	}
 	return nil
-}
-
-func lispInactivate(ctx *zedrouterContext,
-	status *types.NetworkInstanceStatus) {
-	// Go through the AppNetworkConfigs and delete Lisp parameters
-	// that use this service.
-	pub := ctx.pubAppNetworkStatus
-	items := pub.GetAll()
-
-	// When service is deactivated we should delete IID and map-server
-	// configuration also
-	cfgPathnameIID := lispRunDirname + "/" +
-		strconv.FormatUint(uint64(status.LispStatus.IID), 10)
-	if err := os.Remove(cfgPathnameIID); err != nil {
-		log.Errorln(err)
-	}
-
-	for _, ans := range items {
-		appNetStatus := ans.(types.AppNetworkStatus)
-		if len(appNetStatus.OverlayNetworkList) == 0 {
-			continue
-		}
-		for _, olStatus := range appNetStatus.OverlayNetworkList {
-			if olStatus.Network == status.UUID {
-				// Pass global deviceNetworkStatus
-				deleteLispConfiglet(lispRunDirname, false,
-					status.LispStatus.IID, olStatus.EID,
-					olStatus.AppIPAddr,
-					*ctx.deviceNetworkStatus,
-					ctx.legacyDataPlane)
-			}
-		}
-	}
-
-	log.Infof("lispInactivate(%s)\n", status.DisplayName)
 }
 
 func natInactivate(ctx *zedrouterContext,
@@ -1842,8 +1774,7 @@ func doNetworkInstanceFallback(
 				ulStatus := &appNetworkStatus.UnderlayNetworkList[i]
 				if uuid.Equal(ulStatus.Network, status.UUID) {
 					config := lookupAppNetworkConfig(ctx, appNetworkStatus.Key())
-					ipsets := compileAppInstanceIpsets(ctx, config.OverlayNetworkList,
-						config.UnderlayNetworkList)
+					ipsets := compileAppInstanceIpsets(ctx, config.UnderlayNetworkList)
 					ulConfig := &config.UnderlayNetworkList[i]
 					// This should take care of re-programming any ACL rules that
 					// use input match on uplinks.
@@ -1894,8 +1825,7 @@ func doNetworkInstanceFallback(
 				ulStatus := &appNetworkStatus.UnderlayNetworkList[i]
 				if uuid.Equal(ulStatus.Network, status.UUID) {
 					config := lookupAppNetworkConfig(ctx, appNetworkStatus.Key())
-					ipsets := compileAppInstanceIpsets(ctx, config.OverlayNetworkList,
-						config.UnderlayNetworkList)
+					ipsets := compileAppInstanceIpsets(ctx, config.UnderlayNetworkList)
 					ulConfig := &config.UnderlayNetworkList[i]
 					// This should take care of re-programming any ACL rules that
 					// use input match on uplinks.

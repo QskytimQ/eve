@@ -4,10 +4,13 @@
 package hypervisor
 
 import (
+	"github.com/lf-edge/eve/pkg/pillar/types"
 	"reflect"
-	"sort"
 	"testing"
 )
+
+var testDom = &types.DomainStatus{VirtualizationMode: types.HVM}
+var hyper Hypervisor
 
 func TestGetHypervisor(t *testing.T) {
 	if _, err := GetHypervisor("quantum computing"); err == nil {
@@ -21,9 +24,8 @@ func TestGetHypervisor(t *testing.T) {
 
 func TestGetAvailableHypervisors(t *testing.T) {
 	all, enabled := GetAvailableHypervisors()
-	expected := []string{"acrn", "kvm", "null", "xen"}
+	expected := []string{"xen", "kvm", "acrn", "containerd", "null"}
 
-	sort.Strings(all)
 	if !reflect.DeepEqual(all, expected) {
 		t.Errorf("wrong list of available hypervisors: %+q vs. %+q", all, expected)
 	}

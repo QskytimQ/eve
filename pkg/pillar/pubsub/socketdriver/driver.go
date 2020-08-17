@@ -1,3 +1,6 @@
+// Copyright (c) 2019 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package socketdriver
 
 import (
@@ -6,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path"
+	"strings"
 
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	log "github.com/sirupsen/logrus"
@@ -112,6 +116,15 @@ func (s *SocketDriver) Publisher(global bool, name, topic string, persistent boo
 			}
 		}
 		if _, err := os.Stat(sockName); err == nil {
+			// This could either be a left-over in the filesystem
+			// or some other process (or ourselves) using the same
+			// name to publish. Try connect to see if it is the latter.
+			sock, err := net.Dial("unixpacket", sockName)
+			if err == nil {
+				sock.Close()
+				log.Fatalf("Can not publish %s since it it already used",
+					sockName)
+			}
 			if err := os.Remove(sockName); err != nil {
 				errStr := fmt.Sprintf("Publish(%s): %s",
 					name, err)
@@ -150,16 +163,26 @@ func (s *SocketDriver) Subscriber(global bool, name, topic string, persistent bo
 	// Special case for files in /var/tmp/zededa/ and also
 	// for zedclient going away yet metrics being read after it
 	// is gone.
-	agentName := name
+	var agentName string
+	names := strings.Split(name, "/")
+	if len(names) > 0 {
+		agentName = names[0]
+	}
 
 	if global {
 		subFromDir = true
 		dirName = s.fixedDirName(name)
 	} else if agentName == "zedclient" {
 		subFromDir = true
-		dirName = s.pubDirName(name)
+		if persistent {
+			dirName = s.persistentDirName(name)
+		} else {
+			dirName = s.pubDirName(name)
+		}
 	} else if persistent {
-		subFromDir = true
+		// We do the initial Load from the directory if it
+		// exists, but subsequent updates come over IPC
+		subFromDir = false
 		dirName = s.persistentDirName(name)
 	} else {
 		subFromDir = subscribeFromDir

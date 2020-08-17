@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -23,6 +24,7 @@ type SubscriptionImpl struct {
 	SynchronizedHandler SubRestartHandler
 	MaxProcessTimeWarn  time.Duration // If set generate warning if ProcessChange
 	MaxProcessTimeError time.Duration // If set generate warning if ProcessChange
+	Persistent          bool
 
 	// Private fields
 	agentName    string
@@ -43,7 +45,42 @@ func (sub *SubscriptionImpl) MsgChan() <-chan Change {
 
 // Activate start the subscription
 func (sub *SubscriptionImpl) Activate() error {
+	if sub.Persistent {
+		sub.populate()
+	}
 	return sub.driver.Start()
+}
+
+// populate is used when activating a persistent subscription to read
+// from the json files. This ensures that even if the publisher hasn't started
+// yet, the subscriber will be notified with the initial content.
+// This sets restarted if the restarted file was found.
+// Note that this directly calls handleModify thus unlike subsequent
+// changes the agent's handler will be called without going through
+// a select on the MsgChan and ProcessChange call.
+// Subsequent information from the publisher will be compared in handleModify
+// to avoid spurious notifications to the agent.
+// XXX can we miss a handleDelete call if the file is deleted after we load?
+// Need for a mark and then sweep when handleSynchronized is called?
+func (sub *SubscriptionImpl) populate() {
+	name := sub.nameString()
+
+	log.Infof("populate(%s)", name)
+
+	pairs, restarted, err := sub.driver.Load()
+	if err != nil {
+		// Could be a truncated or empty file
+		log.Error(err)
+		return
+	}
+	for key, itemB := range pairs {
+		log.Infof("populate(%s) key %s", name, key)
+		handleModify(sub, key, itemB)
+	}
+	if restarted {
+		handleRestart(sub, true)
+	}
+	log.Infof("populate(%s) done", name)
 }
 
 // ProcessChange process a single change and its parameters. It
@@ -92,7 +129,7 @@ func (sub *SubscriptionImpl) GetAll() map[string]interface{} {
 }
 
 // Iterate - performs some callback function on all items
-func (sub *SubscriptionImpl) Iterate(function fn) {
+func (sub *SubscriptionImpl) Iterate(function base.StrMapFunc) {
 	sub.km.key.Range(function)
 }
 
@@ -164,20 +201,30 @@ func handleModify(ctxArg interface{}, key string, itemcb []byte) {
 		}
 		log.Debugf("pubsub.handleModify(%s/%s) replacing due to diff",
 			name, key)
+		loggable, ok := item.(base.LoggableObject)
+		if ok {
+			loggable.LogModify(m)
+		}
 	} else {
 		// DO NOT log Values. They may contain sensitive information.
 		log.Debugf("pubsub.handleModify(%s) add for key %s\n",
 			name, key)
 		created = true
+		loggable, ok := item.(base.LoggableObject)
+		if ok {
+			loggable.LogCreate()
+		}
 	}
 	sub.km.key.Store(key, item)
 	if log.GetLevel() == log.DebugLevel {
 		sub.dump("after handleModify")
 	}
+	// Need a copy in case the caller will modify e.g., embedded maps
+	newItem := deepCopy(item)
 	if created && sub.CreateHandler != nil {
-		(sub.CreateHandler)(sub.userCtx, key, item)
+		(sub.CreateHandler)(sub.userCtx, key, newItem)
 	} else if sub.ModifyHandler != nil {
-		(sub.ModifyHandler)(sub.userCtx, key, item)
+		(sub.ModifyHandler)(sub.userCtx, key, newItem)
 	}
 	log.Debugf("pubsub.handleModify(%s) done for key %s\n", name, key)
 }
@@ -192,6 +239,10 @@ func handleDelete(ctxArg interface{}, key string) {
 		log.Errorf("pubsub.handleDelete(%s) %s key not found\n",
 			name, key)
 		return
+	}
+	loggable, ok := m.(base.LoggableObject)
+	if ok {
+		loggable.LogDelete()
 	}
 	// DO NOT log Values. They may contain sensitive information.
 	log.Debugf("pubsub.handleDelete(%s) key %s", name, key)

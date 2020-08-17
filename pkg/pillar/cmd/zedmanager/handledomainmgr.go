@@ -11,6 +11,7 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+// MaybeAddDomainConfig makes sure we have a DomainConfig
 func MaybeAddDomainConfig(ctx *zedmanagerContext,
 	aiConfig types.AppInstanceConfig,
 	aiStatus types.AppInstanceStatus,
@@ -18,26 +19,15 @@ func MaybeAddDomainConfig(ctx *zedmanagerContext,
 
 	key := aiConfig.Key()
 	displayName := aiConfig.DisplayName
-	log.Infof("MaybeAddDomainConfig for %s displayName %s\n", key,
+	log.Infof("MaybeAddDomainConfig for %s displayName %s", key,
 		displayName)
 
-	changed := false
 	m := lookupDomainConfig(ctx, key)
 	if m != nil {
-		// XXX any other change? Compare nothing else changed?
-		if m.Activate != aiConfig.Activate {
-			log.Infof("Domain config: Activate changed %s\n", key)
-			changed = true
-		} else {
-			log.Infof("Domain config already exists for %s\n", key)
-		}
+		// Always update to pick up new disks, vifs, Activate etc
+		log.Infof("Domain config already exists for %s", key)
 	} else {
-		log.Infof("Domain config add for %s\n", key)
-		changed = true
-	}
-	if !changed {
-		log.Infof("MaybeAddDomainConfig done for %s\n", key)
-		return nil
+		log.Infof("Domain config add for %s", key)
 	}
 	AppNum := 0
 	if ns != nil {
@@ -56,92 +46,39 @@ func MaybeAddDomainConfig(ctx *zedmanagerContext,
 		CipherBlockStatus: aiConfig.CipherBlockStatus,
 	}
 
-	// Determine number of "disk" targets in list
-	numDisks := 0
-	for _, sc := range aiConfig.StorageConfigList {
-		if sc.Target == "" || sc.Target == "disk" || sc.Target == "tgtunknown" {
-			numDisks++
-		} else {
-			log.Infof("Not allocating disk for Target %s\n",
-				sc.Target)
+	dc.DiskConfigList = make([]types.DiskConfig, 0, len(aiStatus.VolumeRefStatusList))
+	for _, vrc := range aiConfig.VolumeRefConfigList {
+		vrs := getVolumeRefStatusFromAIStatus(&aiStatus, vrc)
+		if vrs == nil {
+			log.Errorf("Missing VolumeRefStatus for (VolumeID: %s, GenerationCounter: %d)",
+				vrc.VolumeID, vrc.GenerationCounter)
+			continue
 		}
-	}
-	dc.DiskConfigList = make([]types.DiskConfig, numDisks)
-	i := 0
-	if len(aiConfig.StorageConfigList) > len(aiStatus.StorageStatusList) {
-		errStr := fmt.Sprintf("More StorageConfig than StorageStatus: %d vs %d", len(aiConfig.StorageConfigList), len(aiStatus.StorageStatusList))
-		log.Error(errStr)
-		return errors.New(errStr)
-	}
-	for index, sc := range aiConfig.StorageConfigList {
-		ssPtr := &aiStatus.StorageStatusList[index]
-		var location string
-
-		switch sc.Target {
-		case "", "disk", "tgtunknown":
-			// Do nothing
-		default:
-			location = ssPtr.ActiveFileLocation
-			if location == "" {
-				errStr := "No ActiveFileLocation"
-				log.Error(errStr)
-				return errors.New(errStr)
-			}
-		}
-
-		switch sc.Target {
-		case "", "disk", "tgtunknown":
-			disk := &dc.DiskConfigList[i]
-			disk.ImageID = sc.ImageID
-			// Pick up sha from verifier
-			disk.ImageSha256 = ssPtr.ImageSha256
-			disk.ReadOnly = sc.ReadOnly
-			disk.Preserve = sc.Preserve
-			disk.Format = sc.Format
-			disk.Maxsizebytes = sc.Maxsizebytes
-			disk.Devtype = sc.Devtype
-			i++
-		case "kernel":
-			if dc.Kernel != "" {
-				log.Infof("Overriding kernel %s with location %s\n",
-					dc.Kernel, location)
-			}
-			dc.Kernel = location
-		case "ramdisk":
-			if dc.Ramdisk != "" {
-				log.Infof("Overriding ramdisk %s with location %s\n",
-					dc.Ramdisk, location)
-			}
-			dc.Ramdisk = location
-		case "device_tree":
-			if dc.DeviceTree != "" {
-				log.Infof("Overriding device_tree %s with location %s\n",
-					dc.DeviceTree, location)
-			}
-			dc.DeviceTree = location
-		default:
-			errStr := fmt.Sprintf("Unknown target %s for %s",
-				sc.Target, displayName)
-			log.Errorln(errStr)
+		location := vrs.ActiveFileLocation
+		if location == "" {
+			errStr := fmt.Sprintf("No ActiveFileLocation for %s", vrs.DisplayName)
+			log.Error(errStr)
 			return errors.New(errStr)
 		}
+		disk := types.DiskConfig{}
+		disk.FileLocation = location
+		disk.ReadOnly = vrs.ReadOnly
+		disk.Format = vrs.ContentFormat
+		disk.MountDir = vrs.MountDir
+		dc.DiskConfigList = append(dc.DiskConfigList, disk)
 	}
 	if ns != nil {
-		olNum := len(ns.OverlayNetworkList)
 		ulNum := len(ns.UnderlayNetworkList)
 
-		dc.VifList = make([]types.VifInfo, olNum+ulNum)
+		dc.VifList = make([]types.VifInfo, ulNum)
 		// Put UL before OL
 		for i, ul := range ns.UnderlayNetworkList {
 			dc.VifList[i] = ul.VifInfo
 		}
-		for i, ol := range ns.OverlayNetworkList {
-			dc.VifList[i+ulNum] = ol.VifInfo
-		}
 	}
 	publishDomainConfig(ctx, &dc)
 
-	log.Infof("MaybeAddDomainConfig done for %s\n", key)
+	log.Infof("MaybeAddDomainConfig done for %s", key)
 	return nil
 }
 
@@ -150,7 +87,7 @@ func lookupDomainConfig(ctx *zedmanagerContext, key string) *types.DomainConfig 
 	pub := ctx.pubDomainConfig
 	c, _ := pub.Get(key)
 	if c == nil {
-		log.Infof("lookupDomainConfig(%s) not found\n", key)
+		log.Infof("lookupDomainConfig(%s) not found", key)
 		return nil
 	}
 	config := c.(types.DomainConfig)
@@ -162,7 +99,7 @@ func lookupDomainStatus(ctx *zedmanagerContext, key string) *types.DomainStatus 
 	sub := ctx.subDomainStatus
 	st, _ := sub.Get(key)
 	if st == nil {
-		log.Infof("lookupDomainStatus(%s) not found\n", key)
+		log.Infof("lookupDomainStatus(%s) not found", key)
 		return nil
 	}
 	status := st.(types.DomainStatus)
@@ -173,7 +110,7 @@ func publishDomainConfig(ctx *zedmanagerContext,
 	status *types.DomainConfig) {
 
 	key := status.Key()
-	log.Debugf("publishDomainConfig(%s)\n", key)
+	log.Debugf("publishDomainConfig(%s)", key)
 	pub := ctx.pubDomainConfig
 	pub.Publish(key, *status)
 }
@@ -181,11 +118,11 @@ func publishDomainConfig(ctx *zedmanagerContext,
 func unpublishDomainConfig(ctx *zedmanagerContext, uuidStr string) {
 
 	key := uuidStr
-	log.Debugf("unpublishDomainConfig(%s)\n", key)
+	log.Debugf("unpublishDomainConfig(%s)", key)
 	pub := ctx.pubDomainConfig
 	c, _ := pub.Get(key)
 	if c == nil {
-		log.Errorf("unpublishDomainConfig(%s) not found\n", key)
+		log.Errorf("unpublishDomainConfig(%s) not found", key)
 		return
 	}
 	pub.Unpublish(key)
@@ -196,18 +133,18 @@ func handleDomainStatusModify(ctxArg interface{}, key string,
 
 	status := statusArg.(types.DomainStatus)
 	ctx := ctxArg.(*zedmanagerContext)
-	log.Infof("handleDomainStatusModify for %s\n", key)
+	log.Infof("handleDomainStatusModify for %s", key)
 	// Record DomainStatus.State even if Pending() to capture HALTING
 
 	updateAIStatusUUID(ctx, status.Key())
-	log.Infof("handleDomainStatusModify done for %s\n", key)
+	log.Infof("handleDomainStatusModify done for %s", key)
 }
 
 func handleDomainStatusDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleDomainStatusDelete for %s\n", key)
+	log.Infof("handleDomainStatusDelete for %s", key)
 	ctx := ctxArg.(*zedmanagerContext)
 	removeAIStatusUUID(ctx, key)
-	log.Infof("handleDomainStatusDelete done for %s\n", key)
+	log.Infof("handleDomainStatusDelete done for %s", key)
 }

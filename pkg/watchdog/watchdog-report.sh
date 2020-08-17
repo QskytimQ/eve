@@ -11,7 +11,8 @@
 
 DATE=$(date -Is)
 CURPART=$(cat /run/eve.id)
-echo "Watchdog report at $DATE: $*" >>/persist/reboot-reason
+EVE_VERSION=$(cat /run/eve-release)
+echo "Watchdog report for $CURPART EVE version $EVE_VERSION at $DATE: $*" >>/persist/reboot-reason
 echo "$CURPART" > /persist/reboot-image
 sync
 
@@ -28,11 +29,9 @@ if [ $# -ge 2 ]; then
     fi
 fi
 
-echo "Watchdog report at $DATE: $*" >>/persist/log/watchdog.log
+echo "Watchdog report for $CURPART EVE version $EVE_VERSION at $DATE: $*" >>/persist/log/watchdog.log
 ps >>/persist/log/watchdog.log
 echo "Watchdog report done" >>/persist/log/watchdog.log
-
-echo "Watchdog report at $DATE: $*" >>/persist/reboot-reason
 
 # If a /run/<agent.pid> then look for an oom message in dmesg for that agent
 # and always record <agent> in reboot-reason
@@ -57,7 +56,7 @@ if [ -n "$oom" ]; then
 fi
 if [ -n "$agent" ]; then
     echo "$agent crashed" >>/persist/reboot-reason
-    panic=$(grep panic /persist/rsyslog/syslog.txt)
+    panic=$(grep panic /persist/rsyslog/syslog.txt | tail -1)
     if [ -n "$panic" ]; then
         echo "$panic" >>/persist/reboot-reason
         # Note that panic stack trace might exist tagged with e.g. pillar.err

@@ -26,6 +26,7 @@ Logs coming from xen-tools container are of three kinds:
 * xen hypervisor logs under the name ```hypervisor```
 * each domain launched by xen-tools container also logs under the following names
   * ```guest_vm-[VM_NAME]``` logs the console output for VM_NAME domain
+  * ```guest_vm_err-[VM_NAME]``` logs the console error ouptut for VM_NAME domain
   * ```qemu-dm-[VM_NAME]``` logs the qemu device model output
   * ```qdisk-[VM ID]``` logs the qdisk output
 
@@ -55,6 +56,33 @@ Logmanager instead of now logging directly to file would now send it's logs to m
 ## Log files still present in device
 
 Reboot reason and reboot stack files present in /persist and /persist/log directories. reboot-reaon, reboot-stack files present in /persist/log directory get appended with updates. The sames files in /persist directory keep getting overwritten with new content every time there is USR1 signal sent to a process or in the event of Fatal crash. These stack traces are also exported to cloud using logging mechanism.
+
+## Object life cycle events and relations
+
+Objects in EVE software can transition through many different states. These state transitions can be easily logged/tracked using object logging infrastructure that we have.
+Look at ```pkg/pillar/base/logobjecttypes.go``` for reference.
+
+Life cycle events can be logged automatically for objects that implement ```base.LoggableObject``` interface.
+There are hooks added into pubsub that call logging functions for objects that implement the following methods.
+
+* ```LogKey()```    -> Key using which the object can be identified uniquely
+* ```LogCreate()``` -> Called when a new instance of the object is created in the view of pubsub.
+* ```LogModify()``` -> Called when the object gets modified and published to pubsub.
+* ```LogDelete()``` -> Called when the object is unpublished from pubsub.
+
+Every time a object gets added to pubsub or gets modified log events are automatically generated. This helps in tracing through the state
+transitions that the object goes through while traversing between different EVE services.
+
+Reference implementation can be seen for AppInstanceConfig, AppInstanceStatus objects present in ```pkg/pillar/types/zedmanagertypes.go```.
+
+Similarly relations between objects can be represented/logged using relation type objects with this infrastructure.
+Same relation implementation between AppInstanceConfig and VolumeConfig can be found in functions AddOrRefcountVolumeConfig, MaybeRemoveVolumeConfig.
+
+### Precautions with naming new keys in Log objects
+
+1) Try and use exiting key values used in other object types before creating new keys.
+2) If it becomes mandatory to create a new key field, suffix the key name with the type of value. We currently only support ```-int64``` & ```-bool```
+suffixes for keys. Anything else shall be treated as text/string type by cloud software.
 
 # Helpful debug commands
 

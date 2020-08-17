@@ -9,10 +9,9 @@ import (
 	"net/http"
 	"net/url"
 
-	azure "github.com/lf-edge/eve/pkg/pillar/zedUpload/azureutil"
-
-	//	"strings"
 	"time"
+
+	azure "github.com/lf-edge/eve/pkg/pillar/zedUpload/azureutil"
 )
 
 func (ep *AzureTransportMethod) Action(req *DronaRequest) error {
@@ -47,6 +46,8 @@ func (ep *AzureTransportMethod) Action(req *DronaRequest) error {
 		if err == nil {
 			req.SasURI = sasURI
 		}
+	case SysOpDownloadByChunks:
+		err = ep.processAzureDownloadByChunks(req)
 	default:
 		err = fmt.Errorf("Unknown Azure Blob datastore operation")
 	}
@@ -121,7 +122,7 @@ func (ep *AzureTransportMethod) processAzureDownload(req *DronaRequest) error {
 			}
 		}(req, prgChan)
 	}
-	err := azure.DownloadAzureBlob(ep.acName, ep.acKey, ep.container, file, req.objloc, ep.hClient, prgChan)
+	err := azure.DownloadAzureBlob(ep.acName, ep.acKey, ep.container, file, req.objloc, req.sizelimit, ep.hClient, prgChan)
 	if err != nil {
 		return err
 	}
@@ -159,11 +160,26 @@ func (ep *AzureTransportMethod) getContext() *DronaCtx {
 }
 
 func (ep *AzureTransportMethod) processAzureUploadByChunks(req *DronaRequest) error {
-	return azure.UploadPartByChunk(ep.acName, ep.acKey, ep.container, req.localName, req.PartID, ep.hClient, req.Adata)
+	return azure.UploadPartByChunk(ep.acName, ep.acKey, ep.container, req.localName, req.UploadID, ep.hClient, req.Adata)
+}
+
+func (ep *AzureTransportMethod) processAzureDownloadByChunks(req *DronaRequest) error {
+	readCloser, size, err := azure.DownloadAzureBlobByChunks(ep.acName, ep.acKey, ep.container, req.name, req.objloc, ep.hClient)
+	if err != nil {
+		return err
+	}
+	req.chunkInfoChan = make(chan ChunkData, 1)
+	chunkChan := make(chan ChunkData)
+	go func(chunkChan chan ChunkData) {
+		for chunkData := range chunkChan {
+			ep.ctx.postChunk(req, chunkData)
+		}
+	}(chunkChan)
+	return processChunkByChunk(readCloser, size, chunkChan)
 }
 
 func (ep *AzureTransportMethod) processGenerateBlobSasURI(req *DronaRequest) (string, error) {
-	return azure.GenerateBlobSasURI(ep.acName, ep.acKey, ep.container, req.localName, ep.hClient, req.startTime, req.endTime)
+	return azure.GenerateBlobSasURI(ep.acName, ep.acKey, ep.container, req.localName, ep.hClient, req.Duration)
 }
 
 func (ep *AzureTransportMethod) processPutBlockListIntoBlob(req *DronaRequest) error {

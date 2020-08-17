@@ -4,73 +4,51 @@
 package types
 
 import (
+	"encoding/hex"
+
 	zconfig "github.com/lf-edge/eve/api/go/config"
-	"time"
+	zcommon "github.com/lf-edge/eve/api/go/evecommon"
 )
 
-// CipherContextConfig : a pair of device and controller certificate
+// CipherContext : a pair of device and controller certificate
 // published by controller along with some attributes
 // part of EdgeDevConfig block, received from controller
-type CipherContextConfig struct {
+type CipherContext struct {
 	ContextID          string
-	HashScheme         zconfig.CipherHashAlgorithm
+	HashScheme         zcommon.HashAlgorithm
 	KeyExchangeScheme  zconfig.KeyExchangeScheme
 	EncryptionScheme   zconfig.EncryptionScheme
 	ControllerCertHash []byte
 	DeviceCertHash     []byte
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 // Key :
-func (config *CipherContextConfig) Key() string {
-	return config.ContextID
-}
-
-// CipherContextStatus : context information for the pair
-// of certificates
-type CipherContextStatus struct {
-	ContextID          string
-	HashScheme         zconfig.CipherHashAlgorithm
-	KeyExchangeScheme  zconfig.KeyExchangeScheme
-	EncryptionScheme   zconfig.EncryptionScheme
-	ControllerCertHash []byte
-	DeviceCertHash     []byte
-	ControllerCert     []byte // resolved through cert API
-	DeviceCert         []byte // local device certificate
-	ErrorInfo
-}
-
-// Key :
-func (status *CipherContextStatus) Key() string {
+func (status *CipherContext) Key() string {
 	return status.ContextID
 }
 
-// SetErrorInfo : sets errorinfo on the cipher context status object
-func (status *CipherContextStatus) SetErrorInfo(agentName, strErr string) {
-	status.Error = strErr
-	status.ErrorTime = time.Now()
-	status.ErrorSource = agentName
+// ControllerCertKey :
+func (status *CipherContext) ControllerCertKey() string {
+	return hex.EncodeToString(status.ControllerCertHash)
 }
 
-// ClearErrorInfo : clears errorinfo on the cipher context status object
-func (status *CipherContextStatus) ClearErrorInfo() {
-	status.Error = ""
-	status.ErrorSource = ""
-	status.ErrorTime = time.Time{}
+// EdgeNodeCertKey :
+func (status *CipherContext) EdgeNodeCertKey() string {
+	return hex.EncodeToString(status.DeviceCertHash)
 }
 
 // CipherBlockStatus : Object specific encryption information
 type CipherBlockStatus struct {
-	CipherBlockID     string                    // constructed using individual reference
-	CipherContextID   string                    // cipher context id
-	KeyExchangeScheme zconfig.KeyExchangeScheme // from cipher context
-	EncryptionScheme  zconfig.EncryptionScheme  // from cipher context
-	ControllerCert    []byte                    // inherited from cipher context
-	DeviceCert        []byte                    // inherited from cipher context
-	InitialValue      []byte
-	CipherData        []byte
-	ClearTextHash     []byte
-	IsCipher          bool
-	ErrorInfo
+	CipherBlockID   string // constructed using individual reference
+	CipherContextID string // cipher context id
+	InitialValue    []byte
+	CipherData      []byte
+	ClearTextHash   []byte
+	IsCipher        bool
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
 }
 
 // Key :
@@ -78,16 +56,13 @@ func (status *CipherBlockStatus) Key() string {
 	return status.CipherBlockID
 }
 
-// SetErrorInfo : sets errorinfo on the cipher block status object
-func (status *CipherBlockStatus) SetErrorInfo(agentName, errStr string) {
-	status.Error = errStr
-	status.ErrorTime = time.Now()
-	status.ErrorSource = agentName
-}
-
-// ClearErrorInfo : clears errorinfo on the cipher block status object
-func (status *CipherBlockStatus) ClearErrorInfo() {
-	status.Error = ""
-	status.ErrorSource = ""
-	status.ErrorTime = time.Time{}
+// EncryptionBlock - This is a Mirror of
+// api/proto/config/acipherinfo.proto - EncryptionBlock
+// Always need to keep these two consistent.
+type EncryptionBlock struct {
+	DsAPIKey          string
+	DsPassword        string
+	WifiUserName      string // If the authentication type is EAP
+	WifiPassword      string
+	ProtectedUserData string
 }

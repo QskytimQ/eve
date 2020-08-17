@@ -3,11 +3,12 @@
 
 syntax = "proto3";
 
+package org.lfedge.eve.config;
 option go_package = "github.com/lf-edge/eve/api/go/config";
-option java_package = "com.zededa.cloud.uservice.proto";
+option java_package = "org.lfedge.eve.config";
 
-import "devcommon.proto";
-import "netcmn.proto";
+import "config/devcommon.proto";
+import "config/netcmn.proto";
 
 enum ZNetworkInstType {
   ZNetInstFirst    = 0;

@@ -6,11 +6,7 @@
 package types
 
 import (
-	"path"
-	"time"
-
-	uuid "github.com/satori/go.uuid"
-	log "github.com/sirupsen/logrus"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 )
 
 // XXX more than images; rename type and clean up comments
@@ -23,156 +19,165 @@ import (
 // for the file to be verified.
 
 // VerifyImageConfig captures the verifications which have been requested.
-// The key/index to this is the ImageID which is allocated by the controller.
-// The ImageSha256 may not be known when the VerifyImageConfig is created
+// The key/index to this is the ImageSha256 which is allocated by the controller or resolver.
 type VerifyImageConfig struct {
-	ImageID uuid.UUID // UUID of the image
-	VerifyConfig
-	IsContainer bool // Is this image for a Container?
-	RefCount    uint
-}
-
-// VerifyConfig is shared between VerifyImageConfig and PersistImageConfig
-type VerifyConfig struct {
 	ImageSha256      string // sha256 of immutable image
 	Name             string
 	CertificateChain []string //name of intermediate certificates
 	ImageSignature   []byte   //signature of image
 	SignatureKey     string   //certificate containing public key
+	FileLocation     string   // Current location; should be info about file
+	Size             int64    //FileLocation size
+	RefCount         uint
+	Expired          bool // Used in delete handshake
 }
 
 // Key returns the pubsub Key
 func (config VerifyImageConfig) Key() string {
-	return config.ImageID.String()
-}
-
-func (config VerifyImageConfig) VerifyFilename(fileName string) bool {
-	expect := config.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained key: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-// PersistImageConfig captures the images which already exists in /persist
-// e.g., from before a reboot. Normally these become requested with a
-// VerifyImageConfig, or are garbage collected.
-// The key is the ImageSha256. The existence of a VerifyImageConfig means
-// the client does not want to to be garbage collected. See handshake using
-// the Expired boolean in PersistImageStatus
-type PersistImageConfig struct {
-	VerifyConfig
-	RefCount uint
-}
-
-// Key returns the pubsub Key
-func (config PersistImageConfig) Key() string {
 	return config.ImageSha256
 }
 
+// LogCreate :
+func (config VerifyImageConfig) LogCreate() {
+	logObject := base.NewLogObject(base.VerifyImageConfigLogType, config.Name,
+		nilUUID, config.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("refcount-int64", config.RefCount).
+		AddField("expired-bool", config.Expired).
+		Infof("VerifyImage config create")
+}
+
+// LogModify :
+func (config VerifyImageConfig) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.VerifyImageConfigLogType, config.Name,
+		nilUUID, config.LogKey())
+
+	oldConfig, ok := old.(VerifyImageConfig)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of VerifyImageConfig type")
+	}
+	if oldConfig.RefCount != config.RefCount ||
+		oldConfig.Expired != config.Expired {
+
+		logObject.CloneAndAddField("refcount-int64", config.RefCount).
+			AddField("expired-bool", config.Expired).
+			AddField("old-refcount-int64", oldConfig.RefCount).
+			AddField("old-expired-bool", oldConfig.Expired).
+			Infof("VerifyImage config modify")
+	}
+}
+
+// LogDelete :
+func (config VerifyImageConfig) LogDelete() {
+	logObject := base.EnsureLogObject(base.VerifyImageConfigLogType, config.Name,
+		nilUUID, config.LogKey())
+	logObject.CloneAndAddField("refcount-int64", config.RefCount).
+		AddField("expired-bool", config.Expired).
+		Infof("VerifyImage config delete")
+
+	base.DeleteLogObject(config.LogKey())
+}
+
+// LogKey :
+func (config VerifyImageConfig) LogKey() string {
+	return string(base.VerifyImageConfigLogType) + "-" + config.Key()
+}
+
 // VerifyImageStatus captures the verifications which have been requested.
-// The key/index to this is the ImageID if known otherwise the ImageSha256
-// The sha can come from the verified filename
+// The key/index to this is the ImageSha256
 type VerifyImageStatus struct {
-	ImageID uuid.UUID // UUID of the image if known
-	VerifyStatus
+	ImageSha256   string // sha256 of immutable image
+	Name          string
+	FileLocation  string // Current location
+	Size          int64
 	PendingAdd    bool
 	PendingModify bool
 	PendingDelete bool
-	IsContainer   bool    // Is this image for a Container?
 	State         SwState // DELIVERED; LastErr* set if failed
-	LastErr       string  // Verification error
-	LastErrTime   time.Time
-	RefCount      uint
-}
-
-// The VerifyStatus is shared between VerifyImageStatus and PersistImageStatus
-type VerifyStatus struct {
-	ImageSha256  string // sha256 of immutable image
-	Name         string
-	ObjType      string
-	FileLocation string // Current location; should be info about file
-	Size         int64
+	// ErrorAndTime provides SetErrorNow() and ClearError()
+	ErrorAndTime
+	RefCount uint
+	Expired  bool // Used in delete handshake
 }
 
 // Key returns the pubsub Key
 func (status VerifyImageStatus) Key() string {
-	return status.ImageID.String()
-}
-
-func (status VerifyImageStatus) VerifyFilename(fileName string) bool {
-	expect := status.Key() + ".json"
-	ret := expect == fileName
-	if !ret {
-		log.Errorf("Mismatch between filename and contained key: %s vs. %s\n",
-			fileName, expect)
-	}
-	return ret
-}
-
-// PersistImageStatus captures the images which already exists in /persist
-// The key/index to this is the ImageSha256
-// The sha comes from the verified filename
-type PersistImageStatus struct {
-	VerifyStatus
-	RefCount uint
-	LastUse  time.Time // When RefCount dropped to zero
-	Expired  bool      // Handshake to client to ask for permission to delete
-}
-
-// Key returns the pubsub Key
-func (status PersistImageStatus) Key() string {
 	return status.ImageSha256
 }
 
-// ImageDownloadDirNames - Returns pendingDirname, verifierDirname, verifiedDirname
-// for the image.
-func (status VerifyImageStatus) ImageDownloadDirNames() (string, string, string) {
-	downloadDirname := DownloadDirname + "/" + status.ObjType
-
-	var pendingDirname, verifierDirname, verifiedDirname string
-	pendingDirname = downloadDirname + "/pending/" + status.ImageID.String()
-	verifierDirname = downloadDirname + "/verifier/" + status.ImageID.String()
-	verifiedDirname = downloadDirname + "/verified/" + status.ImageSha256
-	return pendingDirname, verifierDirname, verifiedDirname
+// LogCreate :
+func (status VerifyImageStatus) LogCreate() {
+	logObject := base.NewLogObject(base.VerifyImageStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+	if logObject == nil {
+		return
+	}
+	logObject.CloneAndAddField("state", status.State.String()).
+		AddField("refcount-int64", status.RefCount).
+		AddField("expired-bool", status.Expired).
+		AddField("size-int64", status.Size).
+		AddField("filelocation", status.FileLocation).
+		Infof("VerifyImage status create")
 }
 
-// ImageDownloadFilenames - Returns pendingFilename, verifierFilename, verifiedFilename
-// for the image
-func (status VerifyImageStatus) ImageDownloadFilenames() (string, string, string) {
-	var pendingFilename, verifierFilename, verifiedFilename string
+// LogModify :
+func (status VerifyImageStatus) LogModify(old interface{}) {
+	logObject := base.EnsureLogObject(base.VerifyImageStatusLogType, status.Name,
+		nilUUID, status.LogKey())
 
-	pendingDirname, verifierDirname, verifiedDirname :=
-		status.ImageDownloadDirNames()
-	// Handle names which are paths
-	filename := path.Base(status.Name)
-	pendingFilename = pendingDirname + "/" + filename
-	verifierFilename = verifierDirname + "/" + filename
-	verifiedFilename = verifiedDirname + "/" + filename
-	return pendingFilename, verifierFilename, verifiedFilename
+	oldStatus, ok := old.(VerifyImageStatus)
+	if !ok {
+		logObject.Clone().Fatalf("LogModify: Old object interface passed is not of VerifyImageStatus type")
+	}
+	if oldStatus.State != status.State ||
+		oldStatus.RefCount != status.RefCount ||
+		oldStatus.Expired != status.Expired ||
+		oldStatus.Size != status.Size ||
+		oldStatus.FileLocation != status.FileLocation {
+
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("refcount-int64", status.RefCount).
+			AddField("expired-bool", status.Expired).
+			AddField("size-int64", status.Size).
+			AddField("old-state", oldStatus.State.String()).
+			AddField("old-refcount-int64", oldStatus.RefCount).
+			AddField("old-expired-bool", oldStatus.Expired).
+			AddField("old-size-int64", oldStatus.Size).
+			AddField("filelocation", status.FileLocation).
+			AddField("old-filelocation", oldStatus.FileLocation).
+			Infof("VerifyImage status modify")
+	}
+
+	if status.HasError() {
+		errAndTime := status.ErrorAndTime
+		logObject.CloneAndAddField("state", status.State.String()).
+			AddField("error", errAndTime.Error).
+			AddField("error-time", errAndTime.ErrorTime).
+			Errorf("VerifyImage status modify")
+	}
 }
 
-func (status VerifyImageStatus) CheckPendingAdd() bool {
-	return status.PendingAdd
+// LogDelete :
+func (status VerifyImageStatus) LogDelete() {
+	logObject := base.EnsureLogObject(base.VerifyImageStatusLogType, status.Name,
+		nilUUID, status.LogKey())
+	logObject.CloneAndAddField("state", status.State.String()).
+		AddField("refcount-int64", status.RefCount).
+		AddField("expired-bool", status.Expired).
+		AddField("size-int64", status.Size).
+		AddField("filelocation", status.FileLocation).
+		Infof("VerifyImage status delete")
+
+	base.DeleteLogObject(status.LogKey())
 }
 
-func (status VerifyImageStatus) CheckPendingModify() bool {
-	return status.PendingModify
-}
-
-func (status VerifyImageStatus) CheckPendingDelete() bool {
-	return status.PendingDelete
+// LogKey :
+func (status VerifyImageStatus) LogKey() string {
+	return string(base.VerifyImageStatusLogType) + "-" + status.Key()
 }
 
 func (status VerifyImageStatus) Pending() bool {
 	return status.PendingAdd || status.PendingModify || status.PendingDelete
-}
-
-// ImageDownloadDirName - Returns verifiedDirname
-// for the image.
-func (status PersistImageStatus) ImageDownloadDirName() string {
-	downloadDirname := DownloadDirname + "/" + status.ObjType
-	return downloadDirname + "/verified/" + status.ImageSha256
 }

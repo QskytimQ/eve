@@ -3,8 +3,11 @@
 
 syntax = "proto3";
 
+import "evecommon/devmodelcommon.proto";
+
+package org.lfedge.eve.config;
 option go_package  = "github.com/lf-edge/eve/api/go/config";
-option java_package = "com.zededa.cloud.uservice.proto";
+option java_package = "org.lfedge.eve.config";
 
 //  PhysicalIO
 //     Constitutes set of parameters that define the physical devices.
@@ -88,33 +91,6 @@ message SystemAdapter {
   string lowerLayerName = 8;
 }
 
-enum PhyIoType {
-  PhyIoNoop = 0;
-  PhyIoNetEth = 1;
-  PhyIoUSB = 2;
-  PhyIoCOM = 3;
-  PhyIoAudio = 4;
-  PhyIoNetWLAN = 5;
-  PhyIoNetWWAN = 6;
-  PhyIoHDMI = 7;
-  PhyIoOther = 255;
-}
-
-// How does EVE should use them, for what purpose it is for
-enum PhyIoMemberUsage {
-  PhyIoUsageNone      = 0;
-  // Used by both management and apps.
-  PhyIoUsageMgmtAndApps = 1;
-  // Shared by multiple apps
-  PhyIoUsageShared    = 2;
-  // used by only one app
-  PhyIoUsageDedicated = 3;
-  // Adapter Blocked. Do not use the Adapter.
-  PhyIoUsageDisabled   = 4;
-  // Used for Management traffic only. Cannot be used by Apps.
-  PhyIoUsageMgmtOnly = 5;
-}
-
 // Given additional details for EVE softwar to how to treat this
 // interface. Example policies could be limit use of LTE interface
 // or only use Eth1 only if Eth0 is not available etc
@@ -144,7 +120,7 @@ message PhyIOUsagePolicy {
 //    it can be further configured to either provide IP connectivity or
 //    directly be given to workloads
 message PhysicalIO {
-  PhyIoType ptype           = 1;
+  org.lfedge.eve.common.PhyIoType ptype           = 1;
 
   // physical label typically printed on box.
   // Example Eth0, Eth1, Wifi0, ComA, ComB
@@ -159,6 +135,7 @@ message PhysicalIO {
   //    separated list of integers or even a range of integers. Hence using
   //    a string to address this.
   // "ioports": the address is a string such as "2f8-2ff"
+  // If the type is PhyIoNet*, then there needs to be an "ifname" physaddr.
   map <string, string> phyaddrs = 3;
 
   // logicallabel - provides the ability to model designer to refer
@@ -184,7 +161,7 @@ message PhysicalIO {
 
   // usage - indicates the role of adapter ( mgmt / blocked / app-direct
   //    etc. )
-  PhyIoMemberUsage usage    = 6;
+  org.lfedge.eve.common.PhyIoMemberUsage usage    = 6;
 
   // usagePolicy - Policy Object used to further refine the usage.
   // For example, specify if this should be only used as fallback?

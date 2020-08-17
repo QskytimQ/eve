@@ -3,8 +3,11 @@
 
 syntax = "proto3";
 
+import "evecommon/evecommon.proto";
+
+package org.lfedge.eve.config;
 option go_package  = "github.com/lf-edge/eve/api/go/config";
-option java_package = "com.zededa.cloud.uservice.proto";
+option java_package = "org.lfedge.eve.config";
 
 // Cipher information for sensitive data.
 
@@ -20,19 +23,13 @@ enum EncryptionScheme {
   SA_AES_256_CFB = 1;
 }
 
-enum cipherHashAlgorithm {
-  HASH_NONE = 0;
-  HASH_SHA256_16bytes = 1;  // hash with sha256, the 1st 16 bytes of result in 'senderCertHash'
-  HASH_SHA256_32bytes = 2;  // hash with sha256, the whole 32 bytes of hash result
-}
-
 // Cipher information to decrypt Sensitive Data
 message CipherContext {
   // cipher context id, key to this structure
   string contextId = 1;
 
   // algorithm used to compute hash for certificates
-  cipherHashAlgorithm hashScheme = 2;
+  org.lfedge.eve.common.HashAlgorithm hashScheme = 2;
 
   // for key exchange scheme, like ECDH etc.
   KeyExchangeScheme keyExchangeScheme = 3;
@@ -64,10 +61,13 @@ message CipherBlock {
 
 
 // This message will be filled with the
-// credential details and encrypted across
-//  wire for data in transit, by the controller
+// details to be encrypted and shared across
+// wire for data in transit, by the controller
 // for encryption
-message CredentialBlock {
-  string identity = 1;
-  string password = 2;
+message EncryptionBlock {
+  string dsAPIKey = 1;
+  string dsPassword = 2;
+  string wifiUserName = 3;      // If the authentication type is EAP
+  string wifiPassword = 4;
+  string protectedUserData = 5;
 }

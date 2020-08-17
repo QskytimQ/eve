@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
@@ -10,8 +13,8 @@ import (
 	"time"
 
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedUpload"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	log "github.com/sirupsen/logrus"
@@ -22,20 +25,26 @@ func handleSyncOp(ctx *downloaderContext, key string,
 	config types.DownloaderConfig, status *types.DownloaderStatus,
 	dst *types.DatastoreConfig) {
 	var (
-		err                                        error
-		errStr, locFilename, remoteName, serverURL string
-		syncOp                                     zedUpload.SyncOpType = zedUpload.SyncOpDownload
-		trType                                     zedUpload.SyncTransportType
-		auth                                       *zedUpload.AuthInput
+		err                                                    error
+		errStr, locFilename, locDirname, remoteName, serverURL string
+		syncOp                                                 zedUpload.SyncOpType = zedUpload.SyncOpDownload
+		trType                                                 zedUpload.SyncTransportType
+		auth                                                   *zedUpload.AuthInput
 	)
 
-	if status.ObjType == "" {
-		log.Fatalf("handleSyncOp: No ObjType for %s\n",
-			status.ImageID)
-	}
+	// the target filename, where to place the download, is provided in config.
+	// downloader has two options:
+	//  * download the file part by part, filling up the `Target` until it is complete, and then sending status
+	//  * create a separate cache directory elsewhere under sole downloader control, download the file part by part there,
+	//    and when complete, do a single atomic copy to `Target` and send status
+	// `config.Target` is where it is expected to place the final downloaded file; how it gets there
+	// is up to downloader.
+	// As of this writing, the file is downloaded directly to `config.Target`
+	locFilename = config.Target
+	locDirname = path.Dir(locFilename)
 
 	// construct the datastore context
-	dsCtx, err := constructDatastoreContext(ctx, config, status, *dst)
+	dsCtx, err := constructDatastoreContext(ctx, config.Name, config.NameIsURL, *dst)
 	if err != nil {
 		errStr := fmt.Sprintf("%s, Datastore construction failed, %s", config.Name, err)
 		handleSyncOpResponse(ctx, config, status, locFilename, key, errStr)
@@ -45,42 +54,41 @@ func handleSyncOp(ctx *downloaderContext, key string,
 	// by default the metricsURL _is_ the DownloadURL, but can override in switch
 	metricsUrl := dsCtx.DownloadURL
 
-	locDirname := types.DownloadDirname + "/" + status.ObjType
-	locFilename = locDirname + "/pending"
-	// XXX common routines to determine pathnames?
-	locFilename = locFilename + "/" + config.ImageID.String()
-
-	// update status to DOWNLOAD STARTED
-	status.FileLocation = locFilename
-	status.State = types.DOWNLOAD_STARTED
+	// update status to DOWNLOADING
+	status.State = types.DOWNLOADING
+	// save the name of the Target filename to our status. In theory, this can be
+	// derived, but it is good for the status to say where it *is*, as opposed to
+	// config, which says where it *should be*
+	status.Target = locFilename
 	publishDownloaderStatus(ctx, status)
 
-	if _, err := os.Stat(locFilename); err != nil {
-		log.Debugf("Create %s\n", locFilename)
-		if err = os.MkdirAll(locFilename, 0755); err != nil {
+	// make sure the directory exists - just a safety check
+	if _, err := os.Stat(locDirname); err != nil {
+		log.Debugf("Create %s", locDirname)
+		if err = os.MkdirAll(locDirname, 0755); err != nil {
 			log.Fatal(err)
 		}
 	}
 
-	// Handle names which are paths
-	filename := path.Base(config.Name)
-	locFilename = locFilename + "/" + filename
-
-	log.Infof("Downloading <%s> to <%s> using %v allow non-free port\n",
+	log.Infof("Downloading <%s> to <%s> using %v allow non-free port",
 		config.Name, locFilename, config.AllowNonFreePort)
 
 	var addrCount int
 	if !config.AllowNonFreePort {
 		addrCount = types.CountLocalAddrFreeNoLinkLocal(ctx.deviceNetworkStatus)
-		log.Infof("Have %d free management port addresses\n", addrCount)
+		log.Infof("Have %d free management port addresses", addrCount)
 		err = errors.New("No free IP management port addresses for download")
 	} else {
 		addrCount = types.CountLocalAddrAnyNoLinkLocal(ctx.deviceNetworkStatus)
-		log.Infof("Have %d any management port addresses\n", addrCount)
+		log.Infof("Have %d any management port addresses", addrCount)
 		err = errors.New("No IP management port addresses for download")
 	}
 	if addrCount == 0 {
 		errStr = err.Error()
+		log.Errorf(errStr)
+		handleSyncOpResponse(ctx, config, status, locFilename,
+			key, errStr)
+		return
 	}
 
 	switch dsCtx.TransportMethod {
@@ -104,8 +112,10 @@ func handleSyncOp(ctx *downloaderContext, key string,
 		}
 		trType = zedUpload.SyncAwsTr
 		serverURL = dsCtx.DownloadURL
-		remoteName = filename
-		metricsUrl = fmt.Sprintf("S3:%s/%s", dsCtx.Dpath, filename)
+		// pass in the config.Name instead of 'filename' which
+		// does not contain the prefix of the relative path with '/'s
+		remoteName = config.Name
+		metricsUrl = fmt.Sprintf("S3:%s/%s", dsCtx.Dpath, config.Name)
 
 	case zconfig.DsType_DsAzureBlob.String():
 		auth = &zedUpload.AuthInput{
@@ -158,7 +168,7 @@ func handleSyncOp(ctx *downloaderContext, key string,
 	// ideally in go we would have this as a check for error
 	// and return, but we will get to it later
 	if errStr != "" {
-		log.Errorf("Error preparing to download. All errors:%s\n", errStr)
+		log.Errorf("Error preparing to download. All errors:%s", errStr)
 		handleSyncOpResponse(ctx, config, status, locFilename,
 			key, errStr)
 		return
@@ -176,12 +186,12 @@ func handleSyncOp(ctx *downloaderContext, key string,
 				addrIndex, "")
 		}
 		if err != nil {
-			log.Errorf("GetLocalAddr failed: %s\n", err)
+			log.Errorf("GetLocalAddr failed: %s", err)
 			errStr = errStr + "\n" + err.Error()
 			continue
 		}
 		ifname := types.GetMgmtPortFromAddr(ctx.deviceNetworkStatus, ipSrc)
-		log.Infof("Using IP source %v if %s transport %v\n",
+		log.Infof("Using IP source %v if %s transport %v",
 			ipSrc, ifname, dsCtx.TransportMethod)
 
 		// do the download
@@ -205,6 +215,7 @@ func handleSyncOp(ctx *downloaderContext, key string,
 		} else {
 			size = info.Size()
 		}
+		status.Size = uint64(size)
 		zedcloud.ZedCloudSuccess(ifname,
 			metricsUrl, 1024, size)
 		handleSyncOpResponse(ctx, config, status,
@@ -212,7 +223,7 @@ func handleSyncOp(ctx *downloaderContext, key string,
 		return
 
 	}
-	log.Errorf("All source IP addresses failed. All errors:%s\n", errStr)
+	log.Errorf("All source IP addresses failed. All errors:%s", errStr)
 	handleSyncOpResponse(ctx, config, status, locFilename,
 		key, errStr)
 }
@@ -221,7 +232,7 @@ func handleSyncOp(ctx *downloaderContext, key string,
 func getServerUrl(dsCtx *types.DatastoreContext) (string, error) {
 	u, err := url.Parse(dsCtx.DownloadURL)
 	if err != nil {
-		log.Errorf("URL Parsing failed: %s\n", err)
+		log.Errorf("URL Parsing failed: %s", err)
 		return "", err
 	}
 	return u.Scheme + "://" + u.Host, nil
@@ -235,47 +246,34 @@ func handleSyncOpResponse(ctx *downloaderContext, config types.DownloaderConfig,
 	// based on the result, perform some storage
 	// management also
 
-	if status.ObjType == "" {
-		log.Fatalf("handleSyncOpResponse: No ObjType for %s\n",
-			status.ImageID)
-	}
-
-	locDirname := types.DownloadDirname + "/" + status.ObjType
 	if errStr != "" {
 		// Delete file, and update the storage
-		doDelete(ctx, key, locDirname, status)
-		// free the reserved storage
-		unreserveSpace(ctx, status)
+		doDelete(ctx, key, locFilename, status)
 		status.RetryCount++
 		status.HandleDownloadFail(errStr)
 		publishDownloaderStatus(ctx, status)
-		log.Errorf("handleSyncOpResponse(%s): failed with %s\n",
+		log.Errorf("handleSyncOpResponse(%s): failed with %s",
 			status.Name, errStr)
 		return
 	}
 
-	info, err := os.Stat(locFilename)
+	// make sure the file exists
+	_, err := os.Stat(locFilename)
 	if err != nil {
-		// Delete file, and update the storage
-		doDelete(ctx, key, locDirname, status)
-		// free the reserved storage
-		unreserveSpace(ctx, status)
+		// error, so delete the file
+		doDelete(ctx, key, locFilename, status)
 		errStr := fmt.Sprintf("%v", err)
 		status.RetryCount++
 		status.HandleDownloadFail(errStr)
 		publishDownloaderStatus(ctx, status)
-		log.Errorf("handleSyncOpResponse(%s): failed with %s\n",
+		log.Errorf("handleSyncOpResponse(%s): failed with %s",
 			status.Name, errStr)
 		return
 	}
-	size := uint64(info.Size())
-	// we need to release the reserved space
-	// and convert it to used space
-	allocateSpace(ctx, status, size)
 
-	log.Infof("handleSyncOpResponse(%s): successful <%s>\n",
+	log.Infof("handleSyncOpResponse(%s): successful <%s>",
 		config.Name, locFilename)
-	// We do not clear any status.RetryCount, LastErr, etc. The caller
+	// We do not clear any status.RetryCount, Error, etc. The caller
 	// should look at State == DOWNLOADED to determine it is done.
 
 	status.ModTime = time.Now()
@@ -286,21 +284,21 @@ func handleSyncOpResponse(ctx *downloaderContext, config types.DownloaderConfig,
 }
 
 // cloud storage interface functions/APIs
-func constructDatastoreContext(ctx *downloaderContext, config types.DownloaderConfig, status *types.DownloaderStatus, dst types.DatastoreConfig) (*types.DatastoreContext, error) {
+func constructDatastoreContext(ctx *downloaderContext, configName string, NameIsURL bool, dst types.DatastoreConfig) (*types.DatastoreContext, error) {
 	dpath := dst.Dpath
-	downloadURL := config.Name
-	if !config.NameIsURL {
+	downloadURL := configName
+	if !NameIsURL {
 		downloadURL = dst.Fqdn
 		if len(dpath) > 0 {
 			downloadURL = downloadURL + "/" + dpath
 		}
-		if len(config.Name) > 0 {
-			downloadURL = downloadURL + "/" + config.Name
+		if len(configName) > 0 {
+			downloadURL = downloadURL + "/" + configName
 		}
 	}
 
-	// get the decrypted credentials
-	cred, err := getDatastoreCredential(ctx, dst)
+	// get the decrypted encryption block
+	decBlock, err := getDatastoreCredential(ctx, dst)
 	if err != nil {
 		return nil, err
 	}
@@ -309,26 +307,52 @@ func constructDatastoreContext(ctx *downloaderContext, config types.DownloaderCo
 		DownloadURL:     downloadURL,
 		TransportMethod: dst.DsType,
 		Dpath:           dpath,
-		APIKey:          cred.Identity,
-		Password:        cred.Password,
+		APIKey:          decBlock.DsAPIKey,
+		Password:        decBlock.DsPassword,
 		Region:          dst.Region,
 	}
 	return &dsCtx, nil
 }
 
 func sourceFailureError(ip, ifname, url string, err error) {
-	log.Errorf("Source IP %s failed: %s\n", ip, err)
+	log.Errorf("Source IP %s failed: %s", ip, err)
 	zedcloud.ZedCloudFailure(ifname, url, 1024, 0, false)
 }
 
 func getDatastoreCredential(ctx *downloaderContext,
-	dst types.DatastoreConfig) (zconfig.CredentialBlock, error) {
-	cred := utils.PrepareCipherCred(dst.ApiKey, dst.Password)
-	status, cred, err := utils.GetCipherCredentials(agentName,
-		dst.CipherBlockStatus, cred)
-	if status.IsCipher && len(status.Error) == 0 {
-		log.Infof("%s, cipherblock decryption successful\n", dst.Key())
+	dst types.DatastoreConfig) (types.EncryptionBlock, error) {
+	if dst.CipherBlockStatus.IsCipher {
+		status, decBlock, err := cipher.GetCipherCredentials(&ctx.decryptCipherContext,
+			agentName, dst.CipherBlockStatus)
+		ctx.pubCipherBlockStatus.Publish(status.Key(), status)
+		if err != nil {
+			log.Errorf("%s, datastore config cipherblock decryption unsuccessful, falling back to cleartext: %v",
+				dst.Key(), err)
+			decBlock.DsAPIKey = dst.ApiKey
+			decBlock.DsPassword = dst.Password
+			// We assume IsCipher is only set when there was some
+			// data. Hence this is a fallback if there is
+			// some cleartext.
+			if decBlock.DsAPIKey != "" || decBlock.DsPassword != "" {
+				cipher.RecordFailure(agentName,
+					types.CleartextFallback)
+			} else {
+				cipher.RecordFailure(agentName,
+					types.MissingFallback)
+			}
+			return decBlock, nil
+		}
+		log.Infof("%s, datastore config cipherblock decryption successful", dst.Key())
+		return decBlock, nil
 	}
-	ctx.pubCipherBlockStatus.Publish(status.Key(), status)
-	return cred, err
+	log.Infof("%s, datastore config cipherblock not present", dst.Key())
+	decBlock := types.EncryptionBlock{}
+	decBlock.DsAPIKey = dst.ApiKey
+	decBlock.DsPassword = dst.Password
+	if decBlock.DsAPIKey != "" || decBlock.DsPassword != "" {
+		cipher.RecordFailure(agentName, types.NoCipher)
+	} else {
+		cipher.RecordFailure(agentName, types.NoData)
+	}
+	return decBlock, nil
 }

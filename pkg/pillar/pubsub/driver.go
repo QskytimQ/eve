@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package pubsub
 
 // Driver a backend driver for pubsub
@@ -27,6 +30,14 @@ type DriverSubscriber interface {
 	// background, it is the responsibility of the driver to run it as a separate
 	// goroutine.
 	Start() error
+
+	// Load initial status from persistence. Usually called only on first start.
+	// The implementation is responsible for determining if the load is necessary
+	// or already has been performed. If it has been already, it should not change
+	// anything. The caller has no knowledge of where the persistent state was
+	// stored: disk, databases, or vellum. All it cares about is that it gets
+	// a key-value list.
+	Load() (map[string][]byte, bool, error)
 }
 
 // DriverPublisher interface that a driver for publishing must implement
@@ -60,5 +71,5 @@ type Restarted interface {
 // Differ interface that updates a LocalCollection from previous state to current state,
 // and returns a slice of keys that have changed
 type Differ interface {
-	DetermineDiffs(slaveCollection LocalCollection) []string
+	DetermineDiffs(localCollection LocalCollection) []string
 }

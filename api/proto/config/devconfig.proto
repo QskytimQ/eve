@@ -3,18 +3,19 @@
 
 syntax = "proto3";
 
+package org.lfedge.eve.config;
 option go_package  = "github.com/lf-edge/eve/api/go/config";
-option java_package = "com.zededa.cloud.uservice.proto";
+option java_package = "org.lfedge.eve.config";
 
-import "acipherinfo.proto";
-import "appconfig.proto";
-import "baseosconfig.proto";
-import "devcommon.proto";
-import "devmodel.proto";
-import "mesh.proto";
-import "netconfig.proto";
-import "netinst.proto";
-import "storage.proto";
+import "config/acipherinfo.proto";
+import "config/appconfig.proto";
+import "config/baseosconfig.proto";
+import "config/devcommon.proto";
+import "config/devmodel.proto";
+import "config/mesh.proto";
+import "config/netconfig.proto";
+import "config/netinst.proto";
+import "config/storage.proto";
 
 // This is the response to a GET /api/v1/edgeDevice/config
 // The EdgeDevConfig message carries all of the device's configuration from
@@ -62,10 +63,25 @@ message EdgeDevConfig {
   // containing certificate and other details, to be
   // used for sensitive data decryption
   repeated CipherContext cipherContexts = 19;
+
+  // These images aka ContentTrees and Volumes should be created by EVE
+  // independently of any application usage.
+  // Application instances will refer to the volumes.
+  repeated ContentTree contentInfo = 20;
+  repeated Volume volumes = 21;
+
+  // This field is used by the device to detect when it needs to re-download
+  // the controller certs using the /certs API endpoint.
+  // The controller just needs to ensure this value changes when it wants the
+  // device to re-fetch the controller certs, for instance by having it
+  // be a hash of all of the controller certificates.
+  string controllercert_confighash = 22;
+  // deprecated 23;
 }
 
 message ConfigRequest {
   string configHash = 1;
+  bytes  integrity_token = 2; // value provided by controller during remote attestation
 }
 
 message ConfigResponse {

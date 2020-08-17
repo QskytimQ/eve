@@ -1,3 +1,6 @@
+// Copyright (c) 2019-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package downloader
 
 import (
@@ -11,9 +14,9 @@ func handleDatastoreConfigModify(ctxArg interface{}, key string,
 
 	ctx := ctxArg.(*downloaderContext)
 	config := configArg.(types.DatastoreConfig)
-	log.Infof("handleDatastoreConfigModify for %s\n", key)
+	log.Infof("handleDatastoreConfigModify for %s", key)
 	checkAndUpdateDownloadableObjects(ctx, config.UUID)
-	log.Infof("handleDatastoreConfigModify for %s, done\n", key)
+	log.Infof("handleDatastoreConfigModify for %s, done", key)
 }
 
 func handleDatastoreConfigDelete(ctxArg interface{}, key string,
@@ -22,5 +25,5 @@ func handleDatastoreConfigDelete(ctxArg interface{}, key string,
 	config := configArg.(types.DatastoreConfig)
 	cipherBlock := config.CipherBlockStatus
 	ctx.pubCipherBlockStatus.Unpublish(cipherBlock.Key())
-	log.Infof("handleDatastoreConfigDelete for %s\n", key)
+	log.Infof("handleDatastoreConfigDelete for %s", key)
 }

@@ -15,6 +15,7 @@
 package ipcmonitor
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -23,6 +24,7 @@ import (
 	"strings"
 
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+	"github.com/lf-edge/eve/pkg/pillar/types"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -35,6 +37,8 @@ func Run(ps *pubsub.PubSub) {
 	topicPtr := flag.String("t", "DeviceNetworkStatus",
 		"topic")
 	debugPtr := flag.Bool("d", false, "Debug flag")
+	persistentPtr := flag.Bool("P", false, "Persistent flag")
+	formatPtr := flag.String("f", "go", "format flag, defaults to 'go', supports: 'go', 'json'")
 	flag.Parse()
 	agentName := *agentNamePtr
 	agentScope := *agentScopePtr
@@ -45,6 +49,12 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
+	if *persistentPtr {
+		testPersistent(ps, agentName, agentScope, topic)
+		return
+	}
+	format := *formatPtr
+
 	name := nameString(agentName, agentScope, topic)
 	sockName := fmt.Sprintf("/var/run/%s.sock", name)
 	s, err := net.Dial("unixpacket", sockName)
@@ -115,12 +125,23 @@ func Run(ps *pubsub.PubSub) {
 				log.Errorf("base64: %s\n", err)
 			}
 
-			var output interface{}
-			if err := json.Unmarshal(val, &output); err != nil {
-				log.Fatal(err, "json Unmarshal")
+			switch format {
+			case "go":
+				var output interface{}
+				if err := json.Unmarshal(val, &output); err != nil {
+					log.Fatal(err, "json Unmarshal")
+				}
+				log.Infof("update type %s key %s val %+v\n",
+					t, key, output)
+			case "json":
+				var out bytes.Buffer
+				if err = json.Indent(&out, val, "", "\t"); err != nil {
+					log.Fatalf("unable to indent json: %v", err)
+				}
+				log.Infof("update type %s key %s: %s\n", t, key, out.String())
+			default:
+				log.Fatalf("unsupported format: %s", format)
 			}
-			log.Infof("update type %s key %s val %+v\n",
-				t, key, output)
 
 		default:
 			log.Errorf("Unknown message: %s\n", msg)
@@ -133,5 +154,58 @@ func nameString(agentname, agentscope, topic string) string {
 		return fmt.Sprintf("%s/%s", agentname, topic)
 	} else {
 		return fmt.Sprintf("%s/%s/%s", agentname, agentscope, topic)
+	}
+}
+
+func testPersistent(ps *pubsub.PubSub, agentName string, agentScope string, topic string) {
+	ctx := 3
+	sub, err := ps.NewSubscription(pubsub.SubscriptionOptions{
+		AgentName:  agentName,
+		AgentScope: agentScope,
+		// XXX hard-coded; need nameToType ;-)
+		TopicImpl:     types.DevicePortConfigList{},
+		Activate:      false,
+		Persistent:    true,
+		Ctx:           &ctx,
+		CreateHandler: handleCreate,
+		ModifyHandler: handleModify,
+		DeleteHandler: handleDelete,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+	sub.Activate()
+}
+
+func handleCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	log.Infof("handleCreate(%s) type %T\n", key, statusArg)
+	switch statusArg.(type) {
+	case types.DevicePortConfigList:
+		dpcl := statusArg.(types.DevicePortConfigList)
+		log.Infof("DPCL %+v\n", dpcl)
+	}
+}
+
+func handleModify(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	log.Infof("handleModify(%s) type %T\n", key, statusArg)
+	switch statusArg.(type) {
+	case types.DevicePortConfigList:
+		dpcl := statusArg.(types.DevicePortConfigList)
+		log.Infof("DPCL %+v\n", dpcl)
+	}
+}
+
+func handleDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	log.Infof("handleDelete(%s) type %T\n", key, statusArg)
+	switch statusArg.(type) {
+	case types.DevicePortConfigList:
+		dpcl := statusArg.(types.DevicePortConfigList)
+		log.Infof("DPCL %+v\n", dpcl)
 	}
 }

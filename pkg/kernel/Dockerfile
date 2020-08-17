@@ -1,7 +1,4 @@
-FROM alpine:3.6 as kernel-build
-#linuxkit/alpine:f2f4db272c910d136380781a97e475013fabda8b AS kernel-build
-
-RUN apk update
+FROM linuxkit/alpine:3fdc49366257e53276c6f363956a4353f95d9a81 AS kernel-build
 
 RUN apk add \
     argp-standalone \
@@ -19,35 +16,32 @@ RUN apk add \
     gnupg \
     installkernel \
     kmod \
-    libelf-dev \
-    libressl-dev \
+    elfutils-dev \
     linux-headers \
+    libunwind-dev \
+    mpc1-dev \
+    mpfr-dev \
     ncurses-dev \
-    python2 \
     findutils \
+    openssl-dev \
+    patch \
+    rsync \
     sed \
     squashfs-tools \
     tar \
     xz \
     xz-dev \
-    zlib-dev
+    zlib-dev \
+    openssl
 
-# libunwind-dev pkg is missed from arm64 now, below statement will be removed if the pkg is available.
-RUN [ $(uname -m) == x86_64 ] && apk add libunwind-dev || true
+ARG KERNEL_VERSION_aarch64=4.19.5
+ARG KERNEL_VERSION_x86_64=4.19.5
+ARG KERNEL_SOURCE
+ARG KERNEL_SHA256_SUMS
+ARG KERNEL_PGP2_SIGN
 
-ENV KERNEL_VERSION_aarch64 4.19.5
-ENV KERNEL_SERIES_aarch64 4.19.x
-
-ENV KERNEL_VERSION_x86_64 4.19.5
-ENV KERNEL_SERIES_x86_64 4.19.x
-
-ENV KERNEL_SOURCE=https://www.kernel.org/pub/linux/kernel/v4.x/linux-\${KERNEL_VERSION}.tar.xz
-ENV KERNEL_SHA256_SUMS=https://www.kernel.org/pub/linux/kernel/v4.x/sha256sums.asc
-ENV KERNEL_PGP2_SIGN=https://www.kernel.org/pub/linux/kernel/v4.x/linux-\${KERNEL_VERSION}.tar.sign
-
-
-# The following hack allows us to build different version 
-SHELL ["/bin/sh", "-c", "export KERNEL_VERSION=$(eval echo \\$KERNEL_VERSION_$(uname -m)) ; export KERNEL_SERIES=$(eval echo \\$KERNEL_SERIES_$(uname -m)) ; eval KERNEL_SOURCE=$KERNEL_SOURCE ; eval export KERNEL_PGP2_SIGN=$KERNEL_PGP2_SIGN ; /bin/sh -c \"$1\"", "-" ]
+# The only variable that is used everywhere is KERNEL_SERIES, so we stick it into env
+SHELL ["/bin/sh", "-c", "export KERNEL_SERIES=$(eval echo \\$KERNEL_VERSION_$(uname -m) | sed -e 's#.[^.]*$#.x#') ; /bin/sh -c \"$1\"", "-" ]
 
 # We copy the entire directory. This copies some unneeded files, but
 # allows us to check for the existence /patches-${KERNEL_SERIES} to
@@ -56,7 +50,11 @@ COPY / /
 
 # Download and verify kernel
 # PGP keys: 589DA6B1 (greg@kroah.com) & 6092693E (autosigner@kernel.org) & 00411886 (torvalds@linux-foundation.org)
-RUN curl -fsSLO ${KERNEL_SHA256_SUMS} && \
+RUN KERNEL_VERSION="$(eval echo \$KERNEL_VERSION_"$(uname -m)")" && KERNEL_MAJOR="$(echo "$KERNEL_VERSION" | cut -f1 -d.)" && \
+    KERNEL_SOURCE=${KERNEL_SOURCE:-https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz} && \
+    KERNEL_SHA256_SUMS=${KERNEL_SHA256_SUMS:-https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/sha256sums.asc} && \
+    KERNEL_PGP2_SIGN=${KERNEL_PGP2_SIGN:-https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.sign} && \
+    curl -fsSLO ${KERNEL_SHA256_SUMS} && \
     gpg2 -q --import keys.asc && \
     gpg2 --verify sha256sums.asc && \
     KERNEL_SHA256=$(grep linux-${KERNEL_VERSION}.tar.xz sha256sums.asc | cut -d ' ' -f 1) && \
@@ -65,7 +63,8 @@ RUN curl -fsSLO ${KERNEL_SHA256_SUMS} && \
     xz -d linux-${KERNEL_VERSION}.tar.xz && \
     curl -fsSLO ${KERNEL_PGP2_SIGN} && \
     gpg2 --verify linux-${KERNEL_VERSION}.tar.sign linux-${KERNEL_VERSION}.tar && \
-    cat linux-${KERNEL_VERSION}.tar | tar --absolute-names -x && mv /linux-${KERNEL_VERSION} /linux
+    cat linux-${KERNEL_VERSION}.tar | tar --absolute-names -x && mv /linux-${KERNEL_VERSION} /linux && \
+    mkdir /out && echo "KERNEL_SOURCE=${KERNEL_SOURCE}" > /out/kernel-source-info
 
 # Apply local patches
 WORKDIR /linux
@@ -73,9 +72,6 @@ RUN set -e ; [ ! -d /patches-"${KERNEL_SERIES}" ] || for patch in /patches-"${KE
         echo "Applying $patch"; \
         patch -p1 < "$patch"; \
     done
-
-# Kernel config
-RUN mkdir /out
 
 RUN case $(uname -m) in \
     x86_64) \
@@ -95,7 +91,7 @@ RUN case $(uname -m) in \
     fi && \
     make defconfig && \
     make oldconfig && \
-    if [ -z "${EXTRA}" ]; then diff .config ${KERNEL_DEF_CONF}; fi
+    if [ -z "${EXTRA}" ]; then diff -cw .config ${KERNEL_DEF_CONF}; fi
 
 # Kernel
 RUN make -j "$(getconf _NPROCESSORS_ONLN)" KCFLAGS="-fno-pie" && \
@@ -112,19 +108,55 @@ RUN make -j "$(getconf _NPROCESSORS_ONLN)" KCFLAGS="-fno-pie" && \
 
 # Modules
 RUN make INSTALL_MOD_PATH=/tmp/kernel-modules modules_install
+
+# Out-of-tree, open source modules
+#  * ZFS on Linux
+RUN apk add --no-cache \
+    attr-dev=2.4.47-r7 \
+    autoconf=2.69-r2 \
+    file=5.36-r0 \
+    libtirpc-dev=1.0.3-r0 \
+    libtool=2.4.6-r5 \
+    util-linux-dev=2.33-r0
+ENV ZFS_VERSION=0.8.4
+ENV ZFS_COMMIT=zfs-${ZFS_VERSION}
+ENV ZFS_REPO=https://github.com/zfsonlinux/zfs.git
+
+WORKDIR /tmp/zfs
+RUN git clone --depth 1 -b ${ZFS_COMMIT} ${ZFS_REPO} .
+RUN ./autogen.sh && \
+    ./configure --with-linux=/linux && \
+    ./scripts/make_gitrev.sh && \
+    make -C module -j "$(getconf _NPROCESSORS_ONLN)" && \
+    make -C module INSTALL_MOD_PATH=/tmp/kernel-modules install # cd /lib/modules && depmod -ae *
+
 # Out-of-tree, creepy modules
 #  * Maxlinear USB (option #2 https://github.com/lipnitsk/xr/archive/master.zip)
+WORKDIR /linux
 ADD https://www.maxlinear.com/document?id=21651 /tmp/xr.zip
 RUN unzip -d /tmp /tmp/xr.zip ;\
     make -C /linux INSTALL_MOD_PATH=/tmp/kernel-modules \
                    M=/tmp/xr_usb_serial_common_lnx-3.6-and-newer-pak \
          modules modules_install
+#  * Realtek rtl8821CU
+RUN git clone https://github.com/brektrou/rtl8821CU.git /tmp/rtl8821CU && (cd /tmp/rtl8821CU ; git checkout 93b04bfcd293fdd7d98d5a7c964ae9416a40159c)
+RUN make -C /tmp/rtl8821CU KSRC=/linux modules
+RUN install -D -p -m 644 /tmp/rtl8821CU/8821cu.ko $(echo /tmp/kernel-modules/lib/modules/*)/kernel/drivers/net/wireless/realtek/rtl8821cu/8821cu.ko
+
+# Device Tree Blobs
+# FIXME: we will switch to a native make INSTALL_DTBS_PATH=/tmp/kernel-modules/boot/dtb dtbs_install at some point
+RUN if [ "$(uname -m)" = aarch64 ]; then \
+       mkdir -p /tmp/kernel-modules/boot/dtb/eve && \
+       ./scripts/dtc/dtc -O dtb -o /tmp/kernel-modules/boot/dtb/eve/eve.dtb -I dts /eve.dts ;\
+       strip --strip-debug `find /tmp/kernel-modules/lib/modules/*/extra -name \*.ko`       ;\
+    fi
+
 # Package all the modules up
 RUN ( DVER=$(basename $(find /tmp/kernel-modules/lib/modules/ -mindepth 1 -maxdepth 1)) && \
       cd /tmp/kernel-modules/lib/modules/$DVER && \
       rm build source && \
       ln -s /usr/src/linux-headers-$DVER build ) && \
-    ( cd /tmp/kernel-modules && tar cf /out/kernel.tar lib )
+    ( cd /tmp/kernel-modules && tar cf /out/kernel.tar . )
 
 # Headers (userspace API)
 RUN mkdir -p /tmp/kernel-headers/usr && \
@@ -144,16 +176,6 @@ RUN DVER=$(basename $(find /tmp/kernel-modules/lib/modules/ -mindepth 1 -maxdept
                       -name '*.lds' -o -name '*.pl' -o -name '*.sh' \) | \
          tar cf - -T - | (cd $dir; tar xf -) && \
     ( cd /tmp && tar cf /out/kernel-dev.tar usr/src )
-
-RUN printf "KERNEL_SOURCE=${KERNEL_SOURCE}\n" > /out/kernel-source-info
-
-# perf (Don't compile for 4.4.x, it's broken and tedious to fix)
-RUN if [ "${KERNEL_SERIES}" != "4.4.x" -a $(uname -m) != aarch64 ]; then \
-       mkdir -p /build/perf && \
-       make -C tools/perf LDFLAGS=-static O=/build/perf && \
-       strip /build/perf/perf && \
-       cp /build/perf/perf /out; \
-     fi
 
 FROM scratch
 ENTRYPOINT []

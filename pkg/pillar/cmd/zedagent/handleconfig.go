@@ -21,7 +21,6 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
-	fileutils "github.com/lf-edge/eve/pkg/pillar/utils/file"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
@@ -51,14 +50,15 @@ type getconfigContext struct {
 	pubZedAgentStatus        pubsub.Publication
 	pubAppInstanceConfig     pubsub.Publication
 	pubAppNetworkConfig      pubsub.Publication
-	pubCertObjConfig         pubsub.Publication
 	pubBaseOsConfig          pubsub.Publication
 	pubDatastoreConfig       pubsub.Publication
 	pubNetworkInstanceConfig pubsub.Publication
-	pubCipherContextConfig   pubsub.Publication
-	pubControllerCertConfig  pubsub.Publication
-	pubCipherContextStatus   pubsub.Publication
-	pubControllerCertStatus  pubsub.Publication
+	pubControllerCert        pubsub.Publication
+	pubCipherContext         pubsub.Publication
+	subContentTreeStatus     pubsub.Subscription
+	pubContentTreeConfig     pubsub.Publication
+	subVolumeStatus          pubsub.Subscription
+	pubVolumeConfig          pubsub.Publication
 	rebootFlag               bool
 }
 
@@ -90,9 +90,10 @@ func handleConfigInit(networkSendTimeout uint32) {
 		NeedStatsFunc:    true,
 		Serial:           hardware.GetProductSerial(),
 		SoftSerial:       hardware.GetSoftSerial(),
+		AgentName:        agentName,
 	})
 
-	log.Infof("Configure Get Device Serial %s, Soft Serial %s, Use V2 API %v\n", zedcloudCtx.DevSerial,
+	log.Infof("Configure Get Device Serial %s, Soft Serial %s, Use V2 API %v", zedcloudCtx.DevSerial,
 		zedcloudCtx.DevSoftSerial, zedcloud.UseV2API())
 
 	// XXX need to redo this since the root certificates can change
@@ -111,7 +112,7 @@ func handleConfigInit(networkSendTimeout uint32) {
 	if err != nil {
 		log.Fatal("uuid.FromString", err, string(b))
 	}
-	log.Infof("Read UUID %s\n", devUUID)
+	log.Infof("Read UUID %s", devUUID)
 	zedcloudCtx.DevUUID = devUUID
 	zcdevUUID = devUUID
 }
@@ -120,13 +121,13 @@ func handleConfigInit(networkSendTimeout uint32) {
 func configTimerTask(handleChannel chan interface{},
 	getconfigCtx *getconfigContext) {
 
-	configUrl := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, false, devUUID, "config")
+	configUrl := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "config")
 	iteration := 0
 	getconfigCtx.rebootFlag = getLatestConfig(configUrl, iteration,
 		getconfigCtx)
 	publishZedAgentStatus(getconfigCtx)
 
-	configInterval := getconfigCtx.zedagentCtx.globalConfig.ConfigInterval
+	configInterval := getconfigCtx.zedagentCtx.globalConfig.GlobalValueInt(types.ConfigInterval)
 	interval := time.Duration(configInterval) * time.Second
 	max := float64(interval)
 	min := max * 0.3
@@ -160,7 +161,7 @@ func configTimerTask(handleChannel chan interface{},
 }
 
 func triggerGetConfig(tickerHandle interface{}) {
-	log.Infof("triggerGetConfig()\n")
+	log.Infof("triggerGetConfig()")
 	flextimer.TickNow(tickerHandle)
 }
 
@@ -174,7 +175,7 @@ func updateConfigTimer(configInterval uint32, tickerHandle interface{}) {
 		return
 	}
 	interval := time.Duration(configInterval) * time.Second
-	log.Infof("updateConfigTimer() change to %v\n", interval)
+	log.Infof("updateConfigTimer() change to %v", interval)
 	max := float64(interval)
 	min := max * 0.3
 	flextimer.UpdateRangeTicker(tickerHandle,
@@ -190,33 +191,43 @@ func updateConfigTimer(configInterval uint32, tickerHandle interface{}) {
 func getLatestConfig(url string, iteration int,
 	getconfigCtx *getconfigContext) bool {
 
-	log.Debugf("getLatestConfig(%s, %d)\n", url, iteration)
+	log.Debugf("getLatestConfig(%s, %d)", url, iteration)
 
-	const return400 = false
+	const bailOnHTTPErr = false // For 4xx and 5xx HTTP errors we try other interfaces
 	getconfigCtx.configGetStatus = types.ConfigGetFail
-	b, cr, err := generateConfigRequest()
+	b, cr, err := generateConfigRequest(getconfigCtx)
 	if err != nil {
 		// XXX	fatal?
 		return false
 	}
 	buf := bytes.NewBuffer(b)
 	size := int64(proto.Size(cr))
-	resp, contents, rtf, err := zedcloud.SendOnAllIntf(&zedcloudCtx, url, size, buf, iteration, return400)
+	resp, contents, rtf, err := zedcloud.SendOnAllIntf(&zedcloudCtx, url, size, buf, iteration, bailOnHTTPErr)
 	if err != nil {
 		newCount := 2
-		if rtf == types.SenderStatusRemTempFail {
-			log.Infof("getLatestConfig remoteTemporaryFailure: %s", err)
+		switch rtf {
+		case types.SenderStatusUpgrade:
+			log.Infof("getLatestConfig : Controller upgrade in progress")
+		case types.SenderStatusRefused:
+			log.Infof("getLatestConfig : Controller returned ECONNREFUSED")
+		case types.SenderStatusCertInvalid:
+			log.Warnf("getLatestConfig : Controller certificate invalid time")
+		case types.SenderStatusCertMiss:
+			log.Infof("getLatestConfig : Controller certificate miss")
+		default:
+			log.Errorf("getLatestConfig  failed: %s", err)
+		}
+		switch rtf {
+		case types.SenderStatusUpgrade, types.SenderStatusRefused, types.SenderStatusCertInvalid:
 			newCount = 3 // Almost connected to controller!
 			// Don't treat as upgrade failure
 			if getconfigCtx.updateInprogress {
 				log.Warnf("remoteTemporaryFailure don't fail update")
 				getconfigCtx.configGetStatus = types.ConfigGetTemporaryFail
 			}
-		} else if rtf == types.SenderStatusCertMiss {
-			// trigger a one sec timer to acquire new certs from cloud
-			triggerFetchCerts(getconfigCtx.zedagentCtx)
-		} else {
-			log.Errorf("getLatestConfig failed: %s", err)
+		case types.SenderStatusCertMiss:
+			// trigger to acquire new controller certs from cloud
+			triggerControllerCertEvent(getconfigCtx.zedagentCtx)
 		}
 		if getconfigCtx.ledManagerCount == 4 {
 			// Inform ledmanager about loss of config from cloud
@@ -230,10 +241,10 @@ func getLatestConfig(url string, iteration int,
 			!getconfigCtx.readSavedConfig && !getconfigCtx.configReceived {
 
 			config, err := readSavedProtoMessage(
-				getconfigCtx.zedagentCtx.globalConfig.StaleConfigTime,
+				getconfigCtx.zedagentCtx.globalConfig.GlobalValueInt(types.StaleConfigTime),
 				checkpointDirname+"/lastconfig", false)
 			if err != nil {
-				log.Errorf("getconfig: %v\n", err)
+				log.Errorf("getconfig: %v", err)
 				return false
 			}
 			if config != nil {
@@ -244,6 +255,25 @@ func getLatestConfig(url string, iteration int,
 					true)
 			}
 		}
+		publishZedAgentStatus(getconfigCtx)
+		return false
+	}
+
+	if resp.StatusCode == http.StatusNotModified {
+		log.Debugf("StatusNotModified len %d", len(contents))
+		// Inform ledmanager about config received from cloud
+		utils.UpdateLedManagerConfig(4)
+		getconfigCtx.ledManagerCount = 4
+
+		if !getconfigCtx.configReceived {
+			getconfigCtx.configReceived = true
+		}
+		getconfigCtx.configGetStatus = types.ConfigGetSuccess
+		publishZedAgentStatus(getconfigCtx)
+
+		log.Debugf("Configuration from zedcloud is unchanged")
+		// Update modification time since checked by readSavedProtoMessage
+		touchReceivedProtoMessage()
 		return false
 	}
 
@@ -252,6 +282,7 @@ func getLatestConfig(url string, iteration int,
 		// Inform ledmanager about cloud connectivity
 		utils.UpdateLedManagerConfig(3)
 		getconfigCtx.ledManagerCount = 3
+		publishZedAgentStatus(getconfigCtx)
 		return false
 	}
 
@@ -261,6 +292,7 @@ func getLatestConfig(url string, iteration int,
 		// Inform ledmanager about cloud connectivity
 		utils.UpdateLedManagerConfig(3)
 		getconfigCtx.ledManagerCount = 3
+		publishZedAgentStatus(getconfigCtx)
 		return false
 	}
 
@@ -272,9 +304,12 @@ func getLatestConfig(url string, iteration int,
 		getconfigCtx.configReceived = true
 	}
 	getconfigCtx.configGetStatus = types.ConfigGetSuccess
+	publishZedAgentStatus(getconfigCtx)
 
 	if !changed {
-		log.Debugf("Configuration from zedcloud is unchanged\n")
+		log.Debugf("Configuration from zedcloud is unchanged")
+		// Update modification time since checked by readSavedProtoMessage
+		touchReceivedProtoMessage()
 		return false
 	}
 	writeReceivedProtoMessage(contents)
@@ -282,64 +317,8 @@ func getLatestConfig(url string, iteration int,
 	return inhaleDeviceConfig(config, getconfigCtx, false)
 }
 
-func getCloudCertChain(ctx *zedagentContext) bool {
-	// get Certs is always V2 API, if the reply turns out it's not, will reset it, use http for now
-	zedcloudCtx.V2API = true
-	certURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, true, nilUUID, "certs")
-	resp, contents, rtf, err := zedcloud.SendOnAllIntf(&zedcloudCtx, certURL, 0, nil, 0, false)
-	if err != nil {
-		if rtf == types.SenderStatusRemTempFail {
-			log.Infof("getCloudCertChain remoteTemporaryFailure: %s", err)
-		} else {
-			log.Errorf("getCloudCertChain failed: %s", err)
-		}
-		return false
-	}
-
-	switch resp.StatusCode {
-	case http.StatusOK, http.StatusCreated, http.StatusNotModified:
-		log.Infof("getCloudCertChain: status %s\n", resp.Status)
-	case http.StatusNotFound, http.StatusUnauthorized, http.StatusNotImplemented, http.StatusBadRequest:
-		log.Infof("getCloudCertChain: server %s does not support V2 API\n", serverName)
-		zedcloudCtx.V2API = false
-		return false
-	default:
-		log.Errorf("getCloudCertChain: statuscode %d %s", resp.StatusCode, http.StatusText(resp.StatusCode))
-		return false
-	}
-
-	err = validateProtoMessage(certURL, resp)
-	if err != nil {
-		log.Errorf("getCloudCertChain: resp header error\n")
-		return false
-	}
-
-	// for cipher object handling
-	parseControllerCerts(ctx, contents)
-
-	certBytes, err := zedcloud.VerifySigningCertChain(&zedcloudCtx, contents)
-	if err != nil {
-		log.Errorf("getCloudCertChain: verify err %v", err)
-		return false
-	}
-	err = fileutils.WriteRename(types.ServerSigningCertFileName, certBytes)
-	if err != nil {
-		log.Errorf("getCloudCertChain: file save err %v", err)
-		return false
-	}
-
-	log.Infof("getCloudCertChain: success\n")
-	return true
-}
-
-func triggerFetchCerts(ctx *zedagentContext) {
-	// trigger a one sec timer to acquire new certs from cloud
-	log.Infof("triggerFetchCerts: set timer for 1 sec\n")
-	ctx.getCertsTimer = time.NewTimer(1 * time.Second)
-}
-
 func validateProtoMessage(url string, r *http.Response) error {
-	//No check Content-Type for empty response
+	// No check Content-Type for empty response
 	if r.ContentLength == 0 {
 		return nil
 	}
@@ -367,6 +346,11 @@ func writeReceivedProtoMessage(contents []byte) {
 	writeProtoMessage("lastconfig", contents)
 }
 
+// Update timestamp - no content changes
+func touchReceivedProtoMessage() {
+	touchProtoMessage("lastconfig")
+}
+
 // XXX for debug we track these
 func writeSentMetricsProtoMessage(contents []byte) {
 	writeProtoMessage("lastmetrics", contents)
@@ -386,8 +370,23 @@ func writeProtoMessage(filename string, contents []byte) {
 	filename = checkpointDirname + "/" + filename
 	err := ioutil.WriteFile(filename, contents, 0744)
 	if err != nil {
-		log.Fatal("writeReceiveProtoMessage", err)
+		log.Fatal("writeProtoMessage", err)
 		return
+	}
+}
+
+// Update modification time
+func touchProtoMessage(filename string) {
+	filename = checkpointDirname + "/" + filename
+	_, err := os.Stat(filename)
+	if err != nil {
+		log.Warn("touchProtoMessage", err)
+		return
+	}
+	currentTime := time.Now()
+	err = os.Chtimes(filename, currentTime, currentTime)
+	if err != nil {
+		log.Fatal("touchProtoMessage", err)
 	}
 }
 
@@ -416,24 +415,29 @@ func readSavedProtoMessage(staleConfigTime uint32,
 		log.Errorln("readSavedProtoMessage", err)
 		return nil, err
 	}
-	var config = &zconfig.EdgeDevConfig{}
-
-	err = proto.Unmarshal(contents, config)
+	var configResponse = &zconfig.ConfigResponse{}
+	err = proto.Unmarshal(contents, configResponse)
 	if err != nil {
 		log.Errorf("readSavedProtoMessage Unmarshalling failed: %v",
 			err)
 		return nil, err
 	}
+	config := configResponse.GetConfig()
 	return config, nil
 }
 
 // The most recent config hash we received. Starts empty
 var prevConfigHash string
 
-func generateConfigRequest() ([]byte, *zconfig.ConfigRequest, error) {
+func generateConfigRequest(getconfigCtx *getconfigContext) ([]byte, *zconfig.ConfigRequest, error) {
 	log.Debugf("generateConfigRequest() sending hash %s", prevConfigHash)
 	configRequest := &zconfig.ConfigRequest{
 		ConfigHash: prevConfigHash,
+	}
+	//Populate integrity token if there is one available
+	iToken, err := readIntegrityToken()
+	if err == nil {
+		configRequest.IntegrityToken = iToken
 	}
 	b, err := proto.Marshal(configRequest)
 	if err != nil {
@@ -446,11 +450,6 @@ func generateConfigRequest() ([]byte, *zconfig.ConfigRequest, error) {
 // Returns changed, config, error. The changed is based the ConfigRequest vs
 // the ConfigResponse hash
 func readConfigResponseProtoMessage(resp *http.Response, contents []byte) (bool, *zconfig.EdgeDevConfig, error) {
-
-	if resp.StatusCode == http.StatusNotModified {
-		log.Debugf("StatusNotModified len %d", len(contents))
-		return false, nil, nil
-	}
 
 	var configResponse = &zconfig.ConfigResponse{}
 	err := proto.Unmarshal(contents, configResponse)
@@ -480,7 +479,7 @@ func inhaleDeviceConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigCo
 	if devId != nil {
 		id, err := uuid.FromString(devId.Uuid)
 		if err != nil {
-			log.Errorf("Invalid UUID %s from cloud: %s\n",
+			log.Errorf("Invalid UUID %s from cloud: %s",
 				devId.Uuid, err)
 			return false
 		}
@@ -491,7 +490,7 @@ func inhaleDeviceConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigCo
 			// not update the hostname nor LISP.
 			// XXX remove once zedcloud preserves state.
 			if id != zcdevUUID {
-				log.Infof("XXX Device UUID changed from %s to %s\n",
+				log.Infof("XXX Device UUID changed from %s to %s",
 					zcdevUUID.String(), id.String())
 				zcdevUUID = id
 				ctx := getconfigCtx.zedagentCtx
@@ -500,7 +499,6 @@ func inhaleDeviceConfig(config *zconfig.EdgeDevConfig, getconfigCtx *getconfigCo
 
 		}
 	}
-	handleLookupParam(getconfigCtx, config)
 
 	// add new BaseOS/App instances; returns rebootFlag
 	return parseConfig(config, getconfigCtx, usingSaved)

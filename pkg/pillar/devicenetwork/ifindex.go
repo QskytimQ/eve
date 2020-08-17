@@ -157,13 +157,14 @@ func RelevantLastResort(link netlink.Link) (bool, bool) {
 	linkFlags := attrs.Flags
 	loopbackFlag := (linkFlags & net.FlagLoopback) != 0
 	broadcastFlag := (linkFlags & net.FlagBroadcast) != 0
+	adminUpFlag := (linkFlags & net.FlagUp) != 0
 	upFlag := (attrs.OperState == netlink.OperUp)
 	isVif := strings.HasPrefix(ifname, "vif") || strings.HasPrefix(ifname, "nbu") || strings.HasPrefix(ifname, "nbo")
 	if linkType == "device" && !loopbackFlag && broadcastFlag &&
 		attrs.MasterIndex == 0 && !isVif {
 
-		log.Infof("Relevant %s up %t operState %s\n",
-			ifname, upFlag, attrs.OperState.String())
+		log.Infof("Relevant %s adminUp %t operState %s\n",
+			ifname, adminUpFlag, attrs.OperState.String())
 		return true, upFlag
 	} else {
 		return false, false
@@ -187,7 +188,7 @@ var ifindexToAddrs = make(map[int][]net.IP)
 
 // Returns true if added
 func IfindexToAddrsAdd(index int, addr net.IP) bool {
-	log.Infof("IfindexToAddrsAdd(%d, %s)", index, addr.String())
+	log.Debugf("IfindexToAddrsAdd(%d, %s)", index, addr.String())
 	addrs, ok := ifindexToAddrs[index]
 	if !ok {
 		log.Debugf("IfindexToAddrsAdd add %v for %d\n", addr, index)
@@ -212,7 +213,7 @@ func IfindexToAddrsAdd(index int, addr net.IP) bool {
 
 // Returns true if deleted
 func IfindexToAddrsDel(index int, addr net.IP) bool {
-	log.Infof("IfindexToAddrsDel(%d, %s)", index, addr.String())
+	log.Debugf("IfindexToAddrsDel(%d, %s)", index, addr.String())
 	addrs, ok := ifindexToAddrs[index]
 	if !ok {
 		log.Warnf("IfindexToAddrsDel unknown index %d\n", index)
@@ -243,7 +244,6 @@ func IfindexToAddrs(index int) ([]net.IP, error) {
 }
 
 func IfindexToAddrsFlush(index int) {
-	log.Infof("IfindexToAddrsFlush(%d)", index)
 	_, ok := ifindexToAddrs[index]
 	if !ok {
 		log.Warnf("IfindexToAddrsFlush: Unknown ifindex %d", index)

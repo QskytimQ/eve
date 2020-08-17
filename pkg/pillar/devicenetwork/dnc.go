@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"time"
 
+	"github.com/lf-edge/eve/pkg/pillar/cipher"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/satori/go.uuid"
@@ -17,16 +18,8 @@ import (
 )
 
 const (
-	MaxDPCRetestCount = 5
-)
-
-type PendDNSStatus uint32
-
-const (
-	DPC_FAIL PendDNSStatus = iota
-	DPC_SUCCESS
-	DPC_WAIT
-	DPC_PCI_WAIT
+	MaxDPCRetestCount  = 5
+	MaxDPCCheckIfCount = 2
 )
 
 type DPCPending struct {
@@ -39,27 +32,32 @@ type DPCPending struct {
 }
 
 type DeviceNetworkContext struct {
-	UsableAddressCount      int
-	DevicePortConfig        *types.DevicePortConfig // Currently in use
-	DevicePortConfigList    *types.DevicePortConfigList
-	AssignableAdapters      *types.AssignableAdapters
-	DevicePortConfigTime    time.Time
-	DeviceNetworkStatus     *types.DeviceNetworkStatus
-	SubDevicePortConfigA    pubsub.Subscription
-	SubDevicePortConfigO    pubsub.Subscription
-	SubDevicePortConfigS    pubsub.Subscription
-	SubAssignableAdapters   pubsub.Subscription
-	PubDevicePortConfig     pubsub.Publication
-	PubDevicePortConfigList pubsub.Publication
-	PubDeviceNetworkStatus  pubsub.Publication
-	Changed                 bool
-	SubGlobalConfig         pubsub.Subscription
+	DecryptCipherContext     cipher.DecryptCipherContext
+	AgentName                string
+	UsableAddressCount       int
+	DevicePortConfig         *types.DevicePortConfig // Currently in use
+	DevicePortConfigList     *types.DevicePortConfigList
+	AssignableAdapters       *types.AssignableAdapters
+	DevicePortConfigTime     time.Time
+	DeviceNetworkStatus      *types.DeviceNetworkStatus
+	SubDevicePortConfigA     pubsub.Subscription
+	SubDevicePortConfigO     pubsub.Subscription
+	SubDevicePortConfigS     pubsub.Subscription
+	SubAssignableAdapters    pubsub.Subscription
+	PubDevicePortConfig      pubsub.Publication
+	PubDummyDevicePortConfig pubsub.Publication // For logging
+	PubDevicePortConfigList  pubsub.Publication
+	PubCipherBlockStatus     pubsub.Publication
+	PubDeviceNetworkStatus   pubsub.Publication
+	Changed                  bool
+	SubGlobalConfig          pubsub.Subscription
 
 	Pending                DPCPending
 	NetworkTestTimer       *time.Timer
 	NetworkTestBetterTimer *time.Timer
 	NextDPCIndex           int
 	CloudConnectivityWorks bool
+	Iteration              int // Start with different interfaces each time
 
 	// Timers in seconds
 	DPCTestDuration           uint32 // Wait for DHCP address
@@ -136,7 +134,7 @@ func compressAndPublishDevicePortConfigList(ctx *DeviceNetworkContext) types.Dev
 
 	dpcl := compressDPCL(ctx)
 	if ctx.PubDevicePortConfigList != nil {
-		log.Infof("publishing DevicePortConfigList: %+v\n", dpcl)
+		log.Infof("publishing DevicePortConfigList compressed: %+v\n", dpcl)
 		ctx.PubDevicePortConfigList.Publish("global", dpcl)
 	}
 	return dpcl
@@ -183,7 +181,7 @@ func compressDPCL(ctx *DeviceNetworkContext) types.DevicePortConfigList {
 				// last resort also found.. discard all remaining entries
 				break
 			}
-			log.Debugf("compressDPCL: Ignoring - i = %d, dpc: %+v", i, dpc)
+			log.Infof("compressDPCL: Ignoring - i = %d, dpc: %+v", i, dpc)
 		}
 	}
 
@@ -195,8 +193,8 @@ func compressDPCL(ctx *DeviceNetworkContext) types.DevicePortConfigList {
 
 var nilUUID = uuid.UUID{} // Really a const
 
-func VerifyPending(pending *DPCPending,
-	aa *types.AssignableAdapters, timeout uint32) PendDNSStatus {
+func VerifyPending(ctx *DeviceNetworkContext, pending *DPCPending,
+	aa *types.AssignableAdapters, timeout uint32) types.PendDPCStatus {
 
 	log.Infof("VerifyPending()\n")
 	// Stop pending timer if its running.
@@ -205,69 +203,81 @@ func VerifyPending(pending *DPCPending,
 	// Check if all the ports in the config are out of pciBack.
 	// If yes, apply config.
 	// If not, wait for all the ports to come out of PCIBack.
-	portInPciBack, portName, usedByUUID := pending.PendDPC.IsAnyPortInPciBack(aa)
+	portInPciBack, ifName, usedByUUID := pending.PendDPC.IsAnyPortInPciBack(aa)
 	if portInPciBack {
 		if usedByUUID != nilUUID {
 			errStr := fmt.Sprintf("port %s in PCIBack "+
-				"used by %s", portName, usedByUUID.String())
+				"used by %s", ifName, usedByUUID.String())
 			log.Errorf("VerifyPending: %s\n", errStr)
-			pending.PendDPC.LastError = errStr
-			pending.PendDPC.LastFailed = time.Now()
-			return DPC_FAIL
+			pending.PendDPC.RecordFailure(errStr)
+			pending.PendDPC.RecordPortFailure(ifName, errStr)
+			return types.DPC_FAIL
 		}
 		log.Infof("VerifyPending: port %s still in PCIBack. "+
 			"wait for it to come out before re-parsing device port config list.\n",
-			portName)
-		return DPC_PCI_WAIT
+			ifName)
+		return types.DPC_PCI_WAIT
 	}
 	log.Infof("VerifyPending: No required ports held in pciBack. " +
 		"parsing device port config list")
 
+	ifname, err := checkInterfacesExists(pending.PendDPC)
+	if err != nil {
+		// Still waiting for a network interface to appear
+		if pending.TestCount < MaxDPCCheckIfCount {
+			log.Warnf("VerifyPending: interface check: retry due to ifname %s at count %d: %s",
+				ifname, pending.TestCount, err)
+			pending.TestCount++
+			return types.DPC_INTF_WAIT
+		}
+		log.Warnf("VerifyPending: interface check: failed due to ifname %s: %s",
+			ifname, err)
+		pending.PendDPC.RecordPortFailure(ifname, err.Error())
+		pending.PendDPC.RecordFailure(err.Error())
+		// Proceed trying other interfaces
+	}
+	log.Infof("VerifyPending: No required ports missing. " +
+		"parsing device port config list")
+
 	if !pending.PendDPC.Equal(&pending.OldDPC) {
 		log.Infof("VerifyPending: DPC changed. check Wireless %v\n", pending.PendDPC)
-		checkAndUpdateWireless(nil, &pending.OldDPC, &pending.PendDPC)
+		checkAndUpdateWireless(ctx, &pending.OldDPC, &pending.PendDPC)
 
 		log.Infof("VerifyPending: DPC changed. update DhcpClient.\n")
-		ifname, err := UpdateDhcpClient(pending.PendDPC, pending.OldDPC)
-		if err != nil {
-			// Still waiting for a network interface
-			if pending.TestCount < MaxDPCRetestCount {
-				log.Warnf("VerifyPending: update DhcpClient: retry due to ifname %s at count %d: %s",
-					ifname, pending.TestCount, err)
-				pending.TestCount++
-				return DPC_WAIT
-			} else {
-				log.Warnf("VerifyPending: update DhcpClient: failed due to ifname %s: %s",
-					ifname, err)
-				// XXX set per interface error to err
-				pending.PendDPC.LastFailed = time.Now()
-				pending.PendDPC.LastError = err.Error()
-				return DPC_FAIL
-			}
-		}
+		UpdateDhcpClient(pending.PendDPC, pending.OldDPC)
 		pending.OldDPC = pending.PendDPC
 	}
 	pend2 := MakeDeviceNetworkStatus(pending.PendDPC, pending.PendDNS)
 	pending.PendDNS = pend2
 
 	// We want connectivity to zedcloud via atleast one Management port.
-	rtf, err := VerifyDeviceNetworkStatus(pending.PendDNS, 1, timeout)
+	// Hard-coded at 1 for now; at least one interface needs to work
+	const successCount uint = 1
+	ctx.Iteration++
+	rtf, intfStatusMap, err := VerifyDeviceNetworkStatus(pending.PendDNS,
+		successCount, ctx.Iteration, timeout)
+	// Use TestResults to update the DevicePortConfigList and DeviceNetworkStatus
+	// Note that the TestResults will at least have an updated timestamp
+	// for one of the ports.
+	dpc := &pending.PendDPC
+	dpc.UpdatePortStatusFromIntfStatusMap(intfStatusMap)
+	ctx.PubDummyDevicePortConfig.Publish(dpc.PubKey(), *dpc)
+	pending.PendDNS.UpdatePortStatusFromIntfStatusMap(intfStatusMap)
 	if err == nil {
 		if checkIfMgmtPortsHaveIPandDNS(pending.PendDNS) {
 			pending.PendDPC.LastIPAndDNS = time.Now()
 		}
-		pending.PendDPC.LastSucceeded = time.Now()
-		pending.PendDPC.LastError = ""
+		pending.PendDPC.RecordSuccess()
 		log.Infof("VerifyPending: DPC passed network test: %+v",
 			pending.PendDPC)
-		return DPC_SUCCESS
+		return types.DPC_SUCCESS
 	}
 	errStr := fmt.Sprintf("Failed network test: %s", err)
 	if rtf {
 		log.Errorf("VerifyPending: remoteTemporaryFailure %s", errStr)
 		// NOTE: do not increase TestCount; we retry until e.g., the
 		// certificate or ECONNREFUSED is fixed on the server side.
-		return DPC_WAIT
+		return types.DPC_REMOTE_WAIT
 	}
 	if !checkIfMgmtPortsHaveIPandDNS(pending.PendDNS) {
 		// Still waiting for IP or DNS
@@ -275,21 +285,33 @@ func VerifyPending(pending *DPCPending,
 			pending.TestCount++
 			log.Infof("VerifyPending no IP/DNS: TestCount %d: %s for %+v\n",
 				pending.TestCount, errStr, pending.PendDNS)
-			return DPC_WAIT
+			return types.DPC_IPDNS_WAIT
 		} else {
 			log.Errorf("VerifyPending no IP/DNS: exceeded TestCount: %s for %+v\n",
 				errStr, pending.PendDNS)
-			pending.PendDPC.LastFailed = time.Now()
-			pending.PendDPC.LastError = errStr
-			return DPC_FAIL
+			pending.PendDPC.RecordFailure(errStr)
+			return types.DPC_FAIL
 		}
 	}
 	log.Errorf("VerifyPending: %s\n", errStr)
 	pending.TestCount = MaxDPCRetestCount
-	pending.PendDPC.LastFailed = time.Now()
-	pending.PendDPC.LastError = errStr
-	pending.PendDPC.LastIPAndDNS = time.Now()
-	return DPC_FAIL
+	pending.PendDPC.RecordFailure(errStr)
+	pending.PendDPC.LastIPAndDNS = pending.PendDPC.LastFailed
+	return types.DPC_FAIL_WITH_IPANDDNS
+}
+
+// Check if all interfaces exist in the kernel
+// Returns the ifname for the first missing if there is an error
+func checkInterfacesExists(dpc types.DevicePortConfig) (string, error) {
+
+	for _, nuc := range dpc.Ports {
+		// Check the ifname exists
+		_, err := IfnameToIndex(nuc.IfName)
+		if err != nil {
+			return nuc.IfName, err
+		}
+	}
+	return "", nil
 }
 
 func VerifyDevicePortConfig(ctx *DeviceNetworkContext) {
@@ -307,34 +329,36 @@ func VerifyDevicePortConfig(ctx *DeviceNetworkContext) {
 
 	passed := false
 	for !passed {
-		res := VerifyPending(&ctx.Pending, ctx.AssignableAdapters,
+		res := VerifyPending(ctx, &ctx.Pending, ctx.AssignableAdapters,
 			ctx.TestSendTimeout)
+		dpc := &ctx.Pending.PendDPC
+		dpc.State = res
+		ctx.PubDummyDevicePortConfig.Publish(dpc.PubKey(), *dpc)
+		ctx.Pending.PendDNS.State = dpc.State
 		UpdateResolvConf(ctx.Pending.PendDNS)
 		UpdatePBR(ctx.Pending.PendDNS)
+		// Publish in case we need a port back from domainmgr
 		if ctx.PubDeviceNetworkStatus != nil {
+			ctx.Pending.PendDNS.Testing = true
+			ctx.Pending.PendDNS.State = res
 			log.Infof("PublishDeviceNetworkStatus: pending %+v\n",
 				ctx.Pending.PendDNS)
-			ctx.Pending.PendDNS.Testing = true
 			ctx.PubDeviceNetworkStatus.Publish("global", ctx.Pending.PendDNS)
 		}
+		log.Infof("VerifyDevicePortConfig: %s for %d",
+			res.String(), ctx.NextDPCIndex)
 		switch res {
-		case DPC_PCI_WAIT:
+		case types.DPC_PCI_WAIT:
 			// We have already published the new DNS for domainmgr.
 			// Wait until we hear from domainmgr before applying (dhcp enable/disable)
 			// and testing this new configuration.
-			log.Infof("VerifyDevicePortConfig: DPC_PCI_WAIT for %d",
-				ctx.NextDPCIndex)
 			return
-		case DPC_WAIT:
+		case types.DPC_IPDNS_WAIT, types.DPC_INTF_WAIT, types.DPC_REMOTE_WAIT:
 			// Either addressChange or PendTimer will result in calling us again.
 			duration := time.Duration(ctx.DPCTestDuration) * time.Second
 			pending.PendTimer = time.NewTimer(duration)
-			log.Infof("VerifyDevicePortConfig: DPC_WAIT for %d",
-				ctx.NextDPCIndex)
 			return
-		case DPC_FAIL:
-			log.Infof("VerifyDevicePortConfig: DPC_FAIL for %d",
-				ctx.NextDPCIndex)
+		case types.DPC_FAIL, types.DPC_FAIL_WITH_IPANDDNS:
 			// Avoid clobbering wrong entry if insert/remove after verification
 			// started
 			tested, index := lookupPortConfig(ctx, pending.PendDPC)
@@ -347,7 +371,7 @@ func VerifyDevicePortConfig(ctx *DeviceNetworkContext) {
 					ctx.DevicePortConfigList.PortConfigList[ctx.NextDPCIndex].Key,
 					pending.PendDPC.Key)
 			}
-			compressAndPublishDevicePortConfigList(ctx)
+			*ctx.DevicePortConfigList = compressAndPublishDevicePortConfigList(ctx)
 			if ctx.DevicePortConfigList.PortConfigList[0].IsDPCUntested() ||
 				ctx.DevicePortConfigList.PortConfigList[0].WasDPCWorking() {
 				log.Warn("VerifyDevicePortConfig DPC_FAIL: New DPC arrived " +
@@ -364,6 +388,16 @@ func VerifyDevicePortConfig(ctx *DeviceNetworkContext) {
 				ctx.NextDPCIndex+1)
 			if nextIndex == -1 {
 				log.Infof("VerifyDevicePortConfig: nothing testable")
+				if res == types.DPC_FAIL_WITH_IPANDDNS {
+					// publish what we have since applications
+					// might need it
+					ctx.DevicePortConfigList.CurrentIndex = ctx.NextDPCIndex
+					*ctx.DevicePortConfig = pending.PendDPC
+					*ctx.DeviceNetworkStatus = pending.PendDNS
+					ctx.DeviceNetworkStatus.Testing = false
+					*ctx.DevicePortConfigList = compressAndPublishDevicePortConfigList(ctx)
+					DoDNSUpdate(ctx)
+				}
 				pending.Inprogress = false
 				// Restart network test timer
 				duration := time.Duration(ctx.NetworkTestInterval) * time.Second
@@ -373,9 +407,7 @@ func VerifyDevicePortConfig(ctx *DeviceNetworkContext) {
 			SetupVerify(ctx, nextIndex)
 			continue
 
-		case DPC_SUCCESS:
-			log.Infof("VerifyDevicePortConfig: DPC_SUCCESS for %d",
-				ctx.NextDPCIndex)
+		case types.DPC_SUCCESS:
 			// Avoid clobbering wrong entry if insert/remove after verification
 			// started
 			tested, index := lookupPortConfig(ctx, pending.PendDPC)
@@ -590,7 +622,9 @@ func HandleAssignableAdaptersModify(ctxArg interface{}, key string,
 	}
 	*ctx.AssignableAdapters = newAssignableAdapters
 	// In case a verification is in progress and is waiting for return from pciback
-	VerifyDevicePortConfig(ctx)
+	if ctx.Pending.Inprogress {
+		VerifyDevicePortConfig(ctx)
+	}
 	log.Infof("handleAssignableAdaptersModify() done\n")
 }
 
@@ -631,7 +665,7 @@ func IngestPortConfigList(ctx *DeviceNetworkContext) {
 	}
 	ctx.DevicePortConfigList = &dpcl
 	log.Infof("Sanitized DPCL %v", dpcl)
-	compressAndPublishDevicePortConfigList(ctx)
+	*ctx.DevicePortConfigList = compressAndPublishDevicePortConfigList(ctx)
 	ctx.DevicePortConfigList.CurrentIndex = -1 // No known working one
 	log.Infof("Published DPCL %v", ctx.DevicePortConfigList)
 	log.Infof("IngestPortConfigList len %d", len(ctx.DevicePortConfigList.PortConfigList))
@@ -693,8 +727,12 @@ func (ctx *DeviceNetworkContext) doUpdatePortConfigListAndPublish(
 			log.Infof("doUpdatePortConfigListAndPublish: no change but timestamps %v %v\n",
 				oldConfig.TimePriority, portConfig.TimePriority)
 
-			if current != nil && current.Equal(oldConfig) {
-				log.Infof("doUpdatePortConfigListAndPublish: no change and same Ports as current\n")
+			// If this is current and current is in use (index=0)
+			// then no work needed. Otherwise we reorder
+			if current != nil && current.Equal(oldConfig) &&
+				currentIndex == 0 {
+
+				log.Infof("doUpdatePortConfigListAndPublish: no change and same Ports as currentIndex=0")
 				return false
 			}
 			log.Infof("doUpdatePortConfigListAndPublish: changed ports from current; reorder\n")
@@ -718,7 +756,8 @@ func (ctx *DeviceNetworkContext) doUpdatePortConfigListAndPublish(
 	if newplace == nil {
 		// Current Got deleted. If [0] was working we stick to it, otherwise we
 		// restart looking through the list.
-		if ctx.DevicePortConfigList.PortConfigList[0].WasDPCWorking() {
+		if len(ctx.DevicePortConfigList.PortConfigList) != 0 &&
+			ctx.DevicePortConfigList.PortConfigList[0].WasDPCWorking() {
 			ctx.DevicePortConfigList.CurrentIndex = 0
 		} else {
 			ctx.DevicePortConfigList.CurrentIndex = -1
@@ -754,7 +793,7 @@ func checkAndUpdateWireless(ctx *DeviceNetworkContext, oCfg *types.DevicePortCon
 				devPortInstallAPname(pCfg.IfName, pCfg.WirelessCfg)
 			} else if pCfg.WirelessCfg.WType == types.WirelessTypeWifi ||
 				oldPortCfg != nil && oldPortCfg.WirelessCfg.WType == types.WirelessTypeWifi {
-				status := devPortInstallWifiConfig(pCfg.IfName, pCfg.WirelessCfg)
+				status := devPortInstallWifiConfig(ctx, pCfg.IfName, pCfg.WirelessCfg)
 				log.Infof("checkAndUpdateWireless: updated wpa file ok %v\n", status)
 			}
 		}
@@ -770,10 +809,8 @@ func updatePortConfig(ctx *DeviceNetworkContext, oldConfig *types.DevicePortConf
 		*oldConfig = portConfig
 		return
 	}
-	// Preserve Last*
-	portConfig.LastFailed = oldConfig.LastFailed
-	portConfig.LastError = oldConfig.LastError
-	portConfig.LastSucceeded = oldConfig.LastSucceeded
+	// Preserve TestResults and Last*
+	portConfig.TestResults = oldConfig.TestResults
 	portConfig.LastIPAndDNS = oldConfig.LastIPAndDNS
 	log.Infof("updatePortConfig: diff time remove+add  %+v\n",
 		portConfig)
@@ -887,10 +924,10 @@ func generateResolvConf(globalStatus types.DeviceNetworkStatus, destfile *os.Fil
 			continue
 		}
 		log.Infof("generateResolvConf %s has %d servers: %v",
-			us.IfName, len(us.DnsServers), us.DnsServers)
+			us.IfName, len(us.DNSServers), us.DNSServers)
 		destfile.WriteString(fmt.Sprintf("# From %s\n", us.IfName))
 		// Avoid duplicate IP addresses for nameservers.
-		for _, server := range us.DnsServers {
+		for _, server := range us.DNSServers {
 			duplicate := false
 			for _, a := range written {
 				if a.Equal(server) {

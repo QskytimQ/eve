@@ -51,6 +51,7 @@ var zcloudCtx = zedcloud.NewContext(zedcloud.ContextOptions{
 	Timeout:       maxRemoteProbeWait,
 	TLSConfig:     &tls.Config{InsecureSkipVerify: true},
 	NeedStatsFunc: true,
+	AgentName:     agentName,
 })
 
 // use probeMutex to protect the status.PInfo[] map entries. When the external
@@ -123,14 +124,14 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 	netstatus *types.NetworkInstanceStatus) bool {
 	var needTrigPing bool
 	log.Debugf("niProbingUpdatePort: %s, type %v, enter\n", netstatus.BridgeName, netstatus.Type)
-	if netstatus.Error != "" {
+	if netstatus.HasError() {
 		log.Errorf("niProbingUpdatePort: Network instance is in errored state: %s",
 			netstatus.Error)
 		return needTrigPing
 	}
 	// we skip the non-Mgmt port for now
 	if !port.IsMgmt {
-		log.Infof("niProbingUpdatePort: %s is type %v, not mgmt, skip\n", port.IfName, port.Type)
+		log.Infof("niProbingUpdatePort: %s is not mgmt, skip", port.IfName)
 		if info, ok := netstatus.PInfo[port.IfName]; ok {
 			log.Infof("niProbingUpdatePort:   info intf %s is present %v\n", info.IfName, info.IsPresent)
 		}
@@ -141,6 +142,12 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 		return needTrigPing
 	}
 
+	// Pick first default router
+	var dr net.IP
+	if len(port.DefaultRouters) > 0 {
+		dr = port.DefaultRouters[0]
+	}
+
 	if _, ok := netstatus.PInfo[port.IfName]; !ok {
 		if port.IfName == "" { // no need to probe for air-gap type of NI
 			return needTrigPing
@@ -149,7 +156,7 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 			IfName:       port.IfName,
 			IsPresent:    true,
 			GatewayUP:    true,
-			NhAddr:       port.Gateway,
+			NhAddr:       dr,
 			LocalAddr:    portGetIntfAddr(port),
 			IsFree:       port.Free,
 			RemoteHostUP: true,
@@ -165,7 +172,7 @@ func niProbingUpdatePort(ctx *zedrouterContext, port types.NetworkPortStatus,
 		info := netstatus.PInfo[port.IfName]
 		prevLocalAddr := info.LocalAddr
 		info.IsPresent = true
-		info.NhAddr = port.Gateway
+		info.NhAddr = dr
 		info.LocalAddr = portGetIntfAddr(port)
 		info.IsFree = port.Free
 		// the probe status are copied inside publish NI status
@@ -393,12 +400,9 @@ func launchHostProbe(ctx *zedrouterContext) {
 					}
 					if foundport {
 						startTime := time.Now()
-						resp, _, rtf, err := zedcloud.SendOnIntf(&zcloudCtx, remoteURL, info.IfName, 0, nil, true)
+						resp, _, _, err := zedcloud.SendOnIntf(&zcloudCtx, remoteURL, info.IfName, 0, nil, true)
 						if err != nil {
 							log.Debugf("launchHostProbe: send on intf %s, err %v\n", info.IfName, err)
-						}
-						if rtf == types.SenderStatusRemTempFail {
-							log.Debugf("launchHostProbe: remote temp failure\n")
 						}
 						if resp != nil {
 							log.Debugf("launchHostProbe: server %s status code %d\n", serverNameAndPort, resp.StatusCode)

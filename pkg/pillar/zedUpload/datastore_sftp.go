@@ -63,6 +63,8 @@ func (ep *SftpTransportMethod) Action(req *DronaRequest) error {
 	case SyncOpGetObjectMetaData:
 		err, contentLength = ep.processSftpObjectMetaData(req)
 		req.contentLength = contentLength
+	case SysOpDownloadByChunks:
+		err = fmt.Errorf("Chunk download for SFTP transport is not supported yet")
 	default:
 		err = fmt.Errorf("Unknown SFTP datastore operation")
 	}
@@ -133,7 +135,7 @@ func (ep *SftpTransportMethod) processSftpUpload(req *DronaRequest) (error, int)
 		}(req, prgChan)
 	}
 
-	resp := sftp.ExecCmd("put", ep.surl, ep.uname, ep.passwd, file, req.objloc, prgChan)
+	resp := sftp.ExecCmd("put", ep.surl, ep.uname, ep.passwd, file, req.objloc, req.sizelimit, prgChan)
 	return resp.Error, int(resp.Asize)
 }
 
@@ -167,7 +169,7 @@ func (ep *SftpTransportMethod) processSftpDownload(req *DronaRequest) (error, in
 		}(req, prgChan)
 	}
 
-	resp := sftp.ExecCmd("fetch", ep.surl, ep.uname, ep.passwd, file, req.objloc, prgChan)
+	resp := sftp.ExecCmd("fetch", ep.surl, ep.uname, ep.passwd, file, req.objloc, req.sizelimit, prgChan)
 	return resp.Error, int(resp.Asize)
 }
 
@@ -181,7 +183,7 @@ func (ep *SftpTransportMethod) processSftpDelete(req *DronaRequest) error {
 			file = ep.path + "/" + req.name
 		}
 	}
-	resp := sftp.ExecCmd("rm", ep.surl, ep.uname, ep.passwd, file, "", nil)
+	resp := sftp.ExecCmd("rm", ep.surl, ep.uname, ep.passwd, file, "", req.sizelimit, nil)
 	return resp.Error
 }
 
@@ -207,7 +209,7 @@ func (ep *SftpTransportMethod) processSftpList(req *DronaRequest) ([]string, err
 		}(req, prgChan)
 	}
 
-	resp := sftp.ExecCmd("ls", ep.surl, ep.uname, ep.passwd, ep.path, "", prgChan)
+	resp := sftp.ExecCmd("ls", ep.surl, ep.uname, ep.passwd, ep.path, "", req.sizelimit, prgChan)
 	return resp.List, resp.Error
 }
 
@@ -220,7 +222,7 @@ func (ep *SftpTransportMethod) processSftpObjectMetaData(req *DronaRequest) (err
 			file = ep.path + "/" + req.name
 		}
 	}
-	resp := sftp.ExecCmd("stat", ep.surl, ep.uname, ep.passwd, file, "", nil)
+	resp := sftp.ExecCmd("stat", ep.surl, ep.uname, ep.passwd, file, "", req.sizelimit, nil)
 	return resp.Error, resp.ContentLength
 }
 

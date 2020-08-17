@@ -1,3 +1,6 @@
+// Copyright (c) 2017-2020 Zededa, Inc.
+// SPDX-License-Identifier: Apache-2.0
+
 package pubsub
 
 import (
@@ -8,6 +11,7 @@ import (
 	"reflect"
 
 	"github.com/google/go-cmp/cmp"
+	"github.com/lf-edge/eve/pkg/pillar/base"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -79,9 +83,18 @@ func (pub *PublicationImpl) Publish(key string, item interface{}) error {
 		// DO NOT log Values. They may contain sensitive information.
 		log.Debugf("Publish(%s/%s) replacing due to diff\n",
 			name, key)
+
+		loggable, ok := newItem.(base.LoggableObject)
+		if ok {
+			loggable.LogModify(m)
+		}
 	} else {
 		// DO NOT log Values. They may contain sensitive information.
 		log.Debugf("Publish(%s/%s) adding Item", name, key)
+		loggable, ok := newItem.(base.LoggableObject)
+		if ok {
+			loggable.LogCreate()
+		}
 	}
 	pub.km.key.Store(key, newItem)
 
@@ -101,9 +114,13 @@ func (pub *PublicationImpl) Publish(key string, item interface{}) error {
 // Unpublish delete a key from the key-value map
 func (pub *PublicationImpl) Unpublish(key string) error {
 	name := pub.nameString()
-	if _, ok := pub.km.key.Load(key); ok {
+	if m, ok := pub.km.key.Load(key); ok {
 		// DO NOT log Values. They may contain sensitive information.
 		log.Debugf("Unpublish(%s/%s) removing Item", name, key)
+		loggable, ok := m.(base.LoggableObject)
+		if ok {
+			loggable.LogDelete()
+		}
 	} else {
 		errStr := fmt.Sprintf("Unpublish(%s/%s): key does not exist",
 			name, key)
@@ -157,7 +174,7 @@ func (pub *PublicationImpl) GetAll() map[string]interface{} {
 }
 
 // Iterate - performs some callback function on all items
-func (pub *PublicationImpl) Iterate(function fn) {
+func (pub *PublicationImpl) Iterate(function base.StrMapFunc) {
 	pub.km.key.Range(function)
 }
 
@@ -215,42 +232,42 @@ func (pub *PublicationImpl) publisher() {
 
 // DetermineDiffs update a provided LocalCollection to the current state,
 // and return the deleted keys before the added/modified ones
-func (pub *PublicationImpl) DetermineDiffs(slaveCollection LocalCollection) []string {
+func (pub *PublicationImpl) DetermineDiffs(localCollection LocalCollection) []string {
 	var keys []string
 	name := pub.nameString()
 	items := pub.GetAll()
 	// Look for deleted
-	for slaveKey := range slaveCollection {
-		_, ok := items[slaveKey]
+	for localKey := range localCollection {
+		_, ok := items[localKey]
 		if !ok {
 			log.Debugf("determineDiffs(%s): key %s deleted\n",
-				name, slaveKey)
-			delete(slaveCollection, slaveKey)
-			keys = append(keys, slaveKey)
+				name, localKey)
+			delete(localCollection, localKey)
+			keys = append(keys, localKey)
 		}
 	}
 	// Look for new/changed
-	for masterKey, master := range items {
-		masterb, err := json.Marshal(master)
+	for originKey, origin := range items {
+		originb, err := json.Marshal(origin)
 		if err != nil {
-			log.Fatalf("json Marshal in DetermineDiffs for master key %s: %v", masterKey, err)
+			log.Fatalf("json Marshal in DetermineDiffs for origin key %s: %v", originKey, err)
 		}
 
-		slave := lookupSlave(slaveCollection, masterKey)
-		if slave == nil {
+		local := lookupLocal(localCollection, originKey)
+		if local == nil {
 			log.Debugf("determineDiffs(%s): key %s added\n",
-				name, masterKey)
-			slaveCollection[masterKey] = masterb
-			keys = append(keys, masterKey)
-		} else if bytes.Compare(masterb, slave) != 0 {
+				name, originKey)
+			localCollection[originKey] = originb
+			keys = append(keys, originKey)
+		} else if bytes.Compare(originb, local) != 0 {
 			log.Debugf("determineDiffs(%s): key %s replacing due to diff\n",
-				name, masterKey)
+				name, originKey)
 			// XXX is deepCopy needed?
-			slaveCollection[masterKey] = masterb
-			keys = append(keys, masterKey)
+			localCollection[originKey] = originb
+			keys = append(keys, originKey)
 		} else {
 			log.Debugf("determineDiffs(%s): key %s unchanged\n",
-				name, masterKey)
+				name, originKey)
 		}
 	}
 	return keys

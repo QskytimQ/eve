@@ -1,7 +1,7 @@
 // Copyright (c) 2017-2018 Zededa, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-// ACL configlet for overlay and underlay interface towards domU
+// ACL configlet for underlay interface towards domU
 
 package zedrouter
 
@@ -116,25 +116,6 @@ func compileAceIpsets(ACLs []types.ACE) []string {
 	return ipsets
 }
 
-func compileOverlayIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkConfig) []string {
-
-	ipsets := []string{}
-	for _, olConfig := range ollist {
-		netconfig := lookupNetworkInstanceConfig(ctx,
-			olConfig.Network.String())
-		if netconfig != nil {
-			// All ipsets from everybody on this network
-			ipsets = append(ipsets, compileNetworkIpsetsConfig(ctx,
-				netconfig)...)
-		} else {
-			log.Errorf("No NetworkInstanceConfig for %s",
-				olConfig.Network.String())
-		}
-	}
-	return ipsets
-}
-
 func compileUnderlayIpsets(ctx *zedrouterContext,
 	ullist []types.UnderlayNetworkConfig) []string {
 
@@ -155,11 +136,9 @@ func compileUnderlayIpsets(ctx *zedrouterContext,
 }
 
 func compileAppInstanceIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkConfig,
 	ullist []types.UnderlayNetworkConfig) []string {
 
 	ipsets := []string{}
-	ipsets = append(ipsets, compileOverlayIpsets(ctx, ollist)...)
 	ipsets = append(ipsets, compileUnderlayIpsets(ctx, ullist)...)
 	return ipsets
 }
@@ -183,13 +162,6 @@ func compileNetworkIpsetsStatus(ctx *zedrouterContext,
 			continue
 		}
 
-		for _, olStatus := range status.OverlayNetworkList {
-			if olStatus.Network != netconfig.UUID {
-				continue
-			}
-			ipsets = append(ipsets,
-				compileAceIpsets(olStatus.ACLs)...)
-		}
 		for _, ulStatus := range status.UnderlayNetworkList {
 			if ulStatus.Network != netconfig.UUID {
 				continue
@@ -213,39 +185,12 @@ func compileNetworkIpsetsConfig(ctx *zedrouterContext,
 	items := sub.GetAll()
 	for _, c := range items {
 		config := c.(types.AppNetworkConfig)
-		for _, olConfig := range config.OverlayNetworkList {
-			if olConfig.Network != netconfig.UUID {
-				continue
-			}
-			ipsets = append(ipsets,
-				compileAceIpsets(olConfig.ACLs)...)
-		}
 		for _, ulConfig := range config.UnderlayNetworkList {
 			if ulConfig.Network != netconfig.UUID {
 				continue
 			}
 			ipsets = append(ipsets,
 				compileAceIpsets(ulConfig.ACLs)...)
-		}
-	}
-	return ipsets
-}
-
-// If skipKey is set ignore any AppNetworkStatus with that key
-func compileOldOverlayIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkStatus, skipKey string) []string {
-
-	ipsets := []string{}
-	for _, olStatus := range ollist {
-		netconfig := lookupNetworkInstanceConfig(ctx,
-			olStatus.Network.String())
-		if netconfig != nil {
-			// All ipsets from everybody on this network
-			ipsets = append(ipsets, compileNetworkIpsetsStatus(ctx,
-				netconfig, skipKey)...)
-		} else {
-			log.Errorf("No NetworkInstanceConfig for %s",
-				olStatus.Network.String())
 		}
 	}
 	return ipsets
@@ -273,11 +218,9 @@ func compileOldUnderlayIpsets(ctx *zedrouterContext,
 
 // If skipKey is set ignore any AppNetworkStatus with that key
 func compileOldAppInstanceIpsets(ctx *zedrouterContext,
-	ollist []types.OverlayNetworkStatus,
 	ullist []types.UnderlayNetworkStatus, skipKey string) []string {
 
 	ipsets := []string{}
-	ipsets = append(ipsets, compileOldOverlayIpsets(ctx, ollist, skipKey)...)
 	ipsets = append(ipsets, compileOldUnderlayIpsets(ctx, ullist, skipKey)...)
 	return ipsets
 }
@@ -878,7 +821,7 @@ func aceToRules(aclArgs types.AppNetworkACLArgs, ace types.ACE) (types.IPTablesR
 			aclRule2.Table = "nat"
 			aclRule2.Chain = "POSTROUTING"
 			aclRule2.Rule = []string{"-o", aclArgs.BridgeName, "-p", protocol,
-				"--dport", targetPort}
+				"--dport", targetPort, "-m", "physdev", "!", "--physdev-is-bridged"}
 			aclRule2.Action = []string{"-j", "SNAT", "--to-source", aclArgs.BridgeIP}
 			aclRule2.IsPortMapRule = true
 			aclRule2.IsUserConfigured = true
@@ -1706,4 +1649,35 @@ func createMarkAndAcceptChain(aclArgs types.AppNetworkACLArgs,
 		return err
 	}
 	return nil
+}
+
+// insert or remove the App Container API endpoint blocking ACL
+func appConfigContainerStatsACL(appIPAddr net.IP, isRemove bool) {
+	var err error
+	action := "-I"
+	// install or remove the App Container Stats blocking ACL
+	// This ACL blocks the other Apps accessing through the same subnet to 'appIPAddr:DOCKERAPIPORT'
+	// in TCP protocol, and only allow the Dom0 process to query the App's docker stats
+	// - this blocking is only possible in the 'raw' table and 'PREROUTING' chain due to the marking
+	//   is done in the 'mangle' of 'PREROUTING'. Install to the front of the 'PREROUTING' list
+	// - this blocking ACL does not block the Dom0 access to the above TCP endpoint on the same
+	//   subnet. This is due to the IP packets from Dom0 to the internal bridge entering the linux
+	//   forwarding through the 'OUTPUT' chain
+	// - this blocking does not seem to work if further matching to the '--physdev', so the drop action
+	//   needs to be at network layer3
+	// - XXX currently the 'drop' mark of 0xffffff on the flow of internal traffic on bridge does not work,
+	//   later it may be possible to change below '-j DROP' to '-j MARK' action
+	if isRemove {
+		action = "-D"
+		err = iptables.IptableCmd("-t", "raw", action, "PREROUTING", "-d", appIPAddr.String(), "-p", "tcp",
+			"--dport", strconv.Itoa(DOCKERAPIPORT), "-j", "DROP")
+	} else {
+		err = iptables.IptableCmd("-t", "raw", action, "PREROUTING", "1", "-d", appIPAddr.String(), "-p", "tcp",
+			"--dport", strconv.Itoa(DOCKERAPIPORT), "-j", "DROP")
+	}
+	if err != nil {
+		log.Errorf("appCheckContainerStatsACL: iptableCmd err %v", err)
+	} else {
+		log.Infof("appCheckContainerStatsACL: iptableCmd %s for %s", action, appIPAddr.String())
+	}
 }

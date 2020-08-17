@@ -93,7 +93,9 @@ func DeleteAzureBlob(accountName, accountKey, containerName, remoteFile string, 
 	return nil
 }
 
-func DownloadAzureBlob(accountName, accountKey, containerName, remoteFile, localFile string, httpClient *http.Client, prgNotify NotifChan) error {
+func DownloadAzureBlob(accountName, accountKey, containerName, remoteFile, localFile string,
+	objSize int64, httpClient *http.Client, prgNotify NotifChan) error {
+
 	stats := UpdateStats{}
 	c, err := NewClient(accountName, accountKey, httpClient)
 	if err != nil {
@@ -133,7 +135,7 @@ func DownloadAzureBlob(accountName, accountKey, containerName, remoteFile, local
 	chunkSize := SingleMB
 	var written, copiedSize int64
 	var copyErr error
-	stats.Size = int64(blob.Properties.ContentLength)
+	stats.Size = objSize
 	for {
 		if written, copyErr = io.CopyN(file, readCloser, chunkSize); copyErr != nil && copyErr != io.EOF {
 			return copyErr
@@ -151,6 +153,41 @@ func DownloadAzureBlob(accountName, accountKey, containerName, remoteFile, local
 		}
 	}
 	return nil
+}
+
+// DownloadAzureBlobByChunks will process the blob download by chunks, i.e., chunks will be
+// responded back on as and hwen they recieve
+func DownloadAzureBlobByChunks(accountName, accountKey, containerName, remoteFile, localFile string, httpClient *http.Client) (io.ReadCloser, int64, error) {
+	c, err := NewClient(accountName, accountKey, httpClient)
+	if err != nil {
+		return nil, 0, err
+	}
+	blobClient := c.GetBlobService()
+	container := blobClient.GetContainerReference(containerName)
+	containerExists, err := container.Exists()
+	if err != nil {
+		return nil, 0, err
+	}
+	if !containerExists {
+		return nil, 0, fmt.Errorf("Container :%s doesn't exist ", containerName)
+	}
+	blob := container.GetBlobReference(remoteFile)
+	exists, err := blob.Exists()
+	if err != nil {
+		return nil, 0, err
+	}
+	if !exists {
+		return nil, 0, fmt.Errorf("%s: blob doesn't exist", remoteFile)
+	}
+	getErr := blob.GetProperties(nil)
+	if getErr != nil {
+		return nil, 0, getErr
+	}
+	readCloser, err := blob.Get(nil)
+	if err != nil {
+		return nil, 0, err
+	}
+	return readCloser, int64(blob.Properties.ContentLength), nil
 }
 
 // PutBlockBlob uploads given stream into a block blob by splitting
@@ -200,10 +237,8 @@ func UploadAzureBlob(accountName, accountKey, containerName, remoteFile, localFi
 	container := blobClient.GetContainerReference(containerName)
 	containerExists, _ := container.Exists()
 	if !containerExists {
-		fmt.Printf("Container is creating")
 		err := container.Create(nil)
 		if err != nil {
-			fmt.Printf("Error %v", err)
 			return location, err
 		}
 	}
@@ -246,7 +281,7 @@ func GetAzureBlobMetaData(accountName, accountKey, containerName, remoteFile str
 }
 
 // GenerateBlobSasURI is used to generate the URI which can be used to access the blob until the the URI expries
-func GenerateBlobSasURI(accountName, accountKey, containerName, remoteFile string, httpClient *http.Client, startTime time.Time, endTime time.Time) (string, error) {
+func GenerateBlobSasURI(accountName, accountKey, containerName, remoteFile string, httpClient *http.Client, duration time.Duration) (string, error) {
 	c, err := NewClient(accountName, accountKey, httpClient)
 	if err != nil {
 		return "", err
@@ -270,8 +305,8 @@ func GenerateBlobSasURI(accountName, accountKey, containerName, remoteFile strin
 	}
 	options := storage.BlobSASOptions{}
 	options.Read = true
-	options.Start = startTime
-	options.Expiry = endTime
+	options.Start = time.Now()
+	options.Expiry = options.Start.Add(duration)
 	options.UseHTTPS = true
 
 	sasURI, err := blob.GetSASURI(options)

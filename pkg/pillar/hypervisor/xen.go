@@ -4,22 +4,18 @@
 package hypervisor
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	zconfig "github.com/lf-edge/eve/api/go/config"
+	"github.com/lf-edge/eve/pkg/pillar/containerd"
 	"github.com/lf-edge/eve/pkg/pillar/types"
-	"github.com/lf-edge/eve/pkg/pillar/wrap"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
+	log "github.com/sirupsen/logrus"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
-	"time"
-
-	log "github.com/sirupsen/logrus"
 )
 
 const (
@@ -52,14 +48,45 @@ func addNoDuplicate(list []string, add string) []string {
 }
 
 type xenContext struct {
+	ctrdContext
 }
 
 func newXen() Hypervisor {
-	return xenContext{}
+	ctrdCtx, err := initContainerd()
+	if err != nil {
+		log.Fatalf("couldn't initialize containerd (this should not happen): %v. Exiting.", err)
+		return nil // it really never returns on account of above
+	}
+	return xenContext{ctrdContext: *ctrdCtx}
 }
 
 func (ctx xenContext) Name() string {
 	return "xen"
+}
+
+func (ctx xenContext) Task(status *types.DomainStatus) types.Task {
+	if status.VirtualizationMode == types.NOHYPER {
+		return ctx.ctrdContext
+	} else {
+		return ctx
+	}
+}
+
+func (ctx xenContext) Setup(status types.DomainStatus, config types.DomainConfig, aa *types.AssignableAdapters, file *os.File) error {
+
+	diskStatusList := status.DiskStatusList
+	domainName := status.DomainName
+	// first lets build the domain config
+	if err := ctx.CreateDomConfig(domainName, config, diskStatusList, aa, file); err != nil {
+		return logError("failed to build domain config: %v", err)
+	}
+
+	args := []string{"/etc/xen/scripts/xen-start", domainName, file.Name()}
+	if err := containerd.LKTaskPrepare(domainName, "xen-tools", &config, 0, args); err != nil {
+		return logError("LKTaskPrepare failed for %s, (%v)", domainName, err)
+	}
+
+	return nil
 }
 
 func (ctx xenContext) CreateDomConfig(domainName string, config types.DomainConfig, diskStatusList []types.DiskStatus,
@@ -119,18 +146,31 @@ func (ctx xenContext) CreateDomConfig(domainName string, config types.DomainConf
 			bootLoader))
 	}
 	if config.EnableVnc {
-		file.WriteString(fmt.Sprintf("vnc = 1\n"))
-		file.WriteString(fmt.Sprintf("vnclisten = \"0.0.0.0\"\n"))
-		file.WriteString(fmt.Sprintf("usb=1\n"))
-		file.WriteString(fmt.Sprintf("usbdevice=[\"tablet\"]\n"))
+		if config.VirtualizationMode == types.PV {
+			vncParams := []string{"vnc=1", "vnclisten=0.0.0.0"}
+			if config.VncDisplay != 0 {
+				vncParams = append(vncParams, fmt.Sprintf("vncdisplay=%d",
+					config.VncDisplay))
+			}
+			if config.VncPasswd != "" {
+				vncParams = append(vncParams, fmt.Sprintf("vncpasswd=\"%s\"\n",
+					config.VncPasswd))
+			}
+			file.WriteString(fmt.Sprintf("vfb = ['%s']\n", strings.Join(vncParams, ", ")))
+		} else {
+			file.WriteString(fmt.Sprintf("vnc = 1\n"))
+			file.WriteString(fmt.Sprintf("vnclisten = \"0.0.0.0\"\n"))
+			file.WriteString(fmt.Sprintf("usb=1\n"))
+			file.WriteString(fmt.Sprintf("usbdevice=[\"tablet\"]\n"))
 
-		if config.VncDisplay != 0 {
-			file.WriteString(fmt.Sprintf("vncdisplay = %d\n",
-				config.VncDisplay))
-		}
-		if config.VncPasswd != "" {
-			file.WriteString(fmt.Sprintf("vncpasswd = \"%s\"\n",
-				config.VncPasswd))
+			if config.VncDisplay != 0 {
+				file.WriteString(fmt.Sprintf("vncdisplay = %d\n",
+					config.VncDisplay))
+			}
+			if config.VncPasswd != "" {
+				file.WriteString(fmt.Sprintf("vncpasswd = \"%s\"\n",
+					config.VncPasswd))
+			}
 		}
 	} else {
 		file.WriteString(fmt.Sprintf("vnc = 0\n"))
@@ -194,14 +234,14 @@ func (ctx xenContext) CreateDomConfig(domainName string, config types.DomainConf
 	for i, ds := range diskStatusList {
 		if ds.Format == zconfig.Format_CONTAINER {
 			p9Strings = append(p9Strings,
-				fmt.Sprintf("'tag=share_dir,security_model=none,path=%s'", ds.FSVolumeLocation))
+				fmt.Sprintf("'tag=share_dir,security_model=none,path=%s'", ds.FileLocation))
 		} else {
 			access := "rw"
 			if ds.ReadOnly {
 				access = "ro"
 			}
 			oneDisk := fmt.Sprintf("'%s,%s,%s,%s'",
-				ds.ActiveFileLocation, strings.ToLower(ds.Format.String()), ds.Vdev, access)
+				ds.FileLocation, strings.ToLower(ds.Format.String()), ds.Vdev, access)
 			log.Debugf("Processing disk %d: %s\n", i, oneDisk)
 			diskStrings = append(diskStrings, oneDisk)
 		}
@@ -339,83 +379,21 @@ func (ctx xenContext) CreateDomConfig(domainName string, config types.DomainConf
 	return nil
 }
 
-func (ctx xenContext) Create(domainName string, xenCfgFilename string) (int, error) {
-	log.Infof("xlCreate %s %s\n", domainName, xenCfgFilename)
-	cmd := "xl"
-	args := []string{
-		"create",
-		xenCfgFilename,
-		"-p",
-	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
-	if err != nil {
-		log.Errorln("xl create failed ", err)
-		log.Errorln("xl create output ", string(stdoutStderr))
-		return 0, fmt.Errorf("xl create failed: %s\n",
-			string(stdoutStderr))
-	}
-	log.Infof("xl create done\n")
-
-	args = []string{
-		"domid",
-		domainName,
-	}
-	stdoutStderr, err = wrap.Command(cmd, args...).CombinedOutput()
-	if err != nil {
-		log.Errorln("xl domid failed ", err)
-		log.Errorln("xl domid output ", string(stdoutStderr))
-		return 0, fmt.Errorf("xl domid failed: %s\n",
-			string(stdoutStderr))
-	}
-	res := strings.TrimSpace(string(stdoutStderr))
-	domainID, err := strconv.Atoi(res)
-	if err != nil {
-		log.Errorf("Can't extract domainID from %s: %s\n", res, err)
-		return 0, fmt.Errorf("Can't extract domainID from %s: %s\n", res, err)
-	}
-	return domainID, nil
-}
-
-func (ctx xenContext) Start(domainName string, domainID int) error {
-	log.Infof("xlUnpause %s %d\n", domainName, domainID)
-	cmd := "xl"
-	args := []string{
-		"unpause",
-		domainName,
-	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
-	if err != nil {
-		log.Errorln("xl unpause failed ", err)
-		log.Errorln("xl unpause output ", string(stdoutStderr))
-		return fmt.Errorf("xl unpause failed: %s\n",
-			string(stdoutStderr))
-	}
-	log.Infof("xlUnpause done. Result %s\n", string(stdoutStderr))
-	return nil
-}
-
 func (ctx xenContext) Stop(domainName string, domainID int, force bool) error {
 	log.Infof("xlShutdown %s %d\n", domainName, domainID)
-	cmd := "xl"
-	var args []string
-	if force {
-		args = []string{
-			"shutdown",
-			"-F",
-			domainName,
-		}
-	} else {
-		args = []string{
-			"shutdown",
-			domainName,
-		}
+	args := []string{
+		"xl",
+		"shutdown",
+		domainName,
 	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
+	if force {
+		args = append(args, "-F")
+	}
+	stdOut, stdErr, err := containerd.CtrExec(domainName, args)
 	if err != nil {
 		log.Errorln("xl shutdown failed ", err)
-		log.Errorln("xl shutdown output ", string(stdoutStderr))
-		return fmt.Errorf("xl shutdown failed: %s\n",
-			string(stdoutStderr))
+		log.Errorln("xl shutdown output ", stdOut, stdErr)
+		return fmt.Errorf("xl shutdown failed: %s %s", stdOut, stdErr)
 	}
 	log.Infof("xl shutdown done\n")
 	return nil
@@ -423,137 +401,65 @@ func (ctx xenContext) Stop(domainName string, domainID int, force bool) error {
 
 func (ctx xenContext) Delete(domainName string, domainID int) error {
 	log.Infof("xlDestroy %s %d\n", domainName, domainID)
-	cmd := "xl"
-	args := []string{
-		"destroy",
-		domainName,
-	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
+	stdOut, stdErr, err := containerd.CtrSystemExec("xen-tools",
+		[]string{"xl", "destroy", domainName})
 	if err != nil {
 		log.Errorln("xl destroy failed ", err)
-		log.Errorln("xl destroy output ", string(stdoutStderr))
-		return fmt.Errorf("xl destroy failed: %s\n",
-			string(stdoutStderr))
+		log.Errorln("xl destroy output ", stdOut, stdErr)
+		return fmt.Errorf("xl destroy failed: %s %s", stdOut, stdErr)
 	}
 	log.Infof("xl destroy done\n")
-	return nil
+
+	// now lets take care of the task itself
+	if err := ctx.ctrdContext.Stop(domainName, domainID, true); err != nil {
+		return err
+	}
+
+	return ctx.ctrdContext.Delete(domainName, domainID)
 }
 
-func (ctx xenContext) Info(domainName string, domainID int) error {
+func (ctx xenContext) Info(domainName string, domainID int) (int, types.SwState, error) {
+	// first we ask for the task status
+	effectiveDomainID, effectiveDomainState, err := ctx.ctrdContext.Info(domainName, domainID)
+	if err != nil || effectiveDomainState != types.RUNNING {
+		return effectiveDomainID, effectiveDomainState, err
+	}
+
+	// if task is alive, we augment task status with finer grained details from xl info
 	log.Infof("xlStatus %s %d\n", domainName, domainID)
-	// XXX xl list -l domainName returns json. XXX but state not included!
-	// Note that state is not very useful anyhow
-	cmd := "xl"
-	args := []string{
-		"list",
-		"-l",
-		domainName,
-	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
-	if err != nil {
-		log.Errorln("xl list failed ", err)
-		log.Errorln("xl list output ", string(stdoutStderr))
-		return fmt.Errorf("xl list failed: %s\n",
-			string(stdoutStderr))
-	}
-	// XXX parse json to look at state? Not currently included
-	// XXX note that there is a warning at the top of the combined
-	// output. If we want to parse the json we need to get Output()
-	log.Infof("xl list done. Result %s\n", string(stdoutStderr))
-	return nil
-}
 
-func (ctx xenContext) LookupByName(domainName string, domainID int) (int, error) {
-	log.Debugf("xlDomid %s %d\n", domainName, domainID)
-	cmd := "xl"
-	args := []string{
-		"domid",
-		domainName,
-	}
-	// Avoid wrap since we are called periodically
-	stdoutStderr, err := exec.Command(cmd, args...).CombinedOutput()
+	stdOut, stdErr, err := containerd.CtrExec(domainName,
+		[]string{"/etc/xen/scripts/xen-info", domainName})
 	if err != nil {
-		log.Debugln("xl domid failed ", err)
-		log.Debugln("xl domid output ", string(stdoutStderr))
-		return domainID, fmt.Errorf("xl domid failed: %s\n",
-			string(stdoutStderr))
+		log.Errorln("xen-info ", err)
+		log.Errorln("xen-info output ", stdOut, stdErr)
+		// XXX this likely means domain has died, we need to fetch its final note
+		// and augment error reported back with it:
+		return effectiveDomainID, types.BROKEN, fmt.Errorf("xen-info failed: %s", err)
 	}
-	res := strings.TrimSpace(string(stdoutStderr))
-	domainID2, err := strconv.Atoi(res)
-	if err != nil {
-		log.Errorf("xl domid not integer %s: failed %s\n", res, err)
-		return domainID, err
-	}
-	if domainID2 != domainID {
-		log.Warningf("domainid changed from %d to %d for %s\n",
-			domainID, domainID2, domainName)
-	}
-	return domainID2, err
-}
+	log.Infof("xen-info done. Result %s\n", stdOut)
 
-// Perform xenstore write to disable all of these for all VIFs
-// feature-sg, feature-gso-tcpv4, feature-gso-tcpv6, feature-ipv6-csum-offload
-func (ctx xenContext) Tune(domainName string, domainID int, vifCount int) error {
-	log.Infof("xlDisableVifOffload %s %d %d\n",
-		domainName, domainID, vifCount)
-	pref := "/local/domain"
-	for i := 0; i < vifCount; i += 1 {
-		varNames := []string{
-			fmt.Sprintf("%s/0/backend/vif/%d/%d/feature-sg",
-				pref, domainID, i),
-			fmt.Sprintf("%s/0/backend/vif/%d/%d/feature-gso-tcpv4",
-				pref, domainID, i),
-			fmt.Sprintf("%s/0/backend/vif/%d/%d/feature-gso-tcpv6",
-				pref, domainID, i),
-			fmt.Sprintf("%s/0/backend/vif/%d/%d/feature-ipv4-csum-offload",
-				pref, domainID, i),
-			fmt.Sprintf("%s/0/backend/vif/%d/%d/feature-ipv6-csum-offload",
-				pref, domainID, i),
-			fmt.Sprintf("%s/%d/device/vif/%d/feature-sg",
-				pref, domainID, i),
-			fmt.Sprintf("%s/%d/device/vif/%d/feature-gso-tcpv4",
-				pref, domainID, i),
-			fmt.Sprintf("%s/%d/device/vif/%d/feature-gso-tcpv6",
-				pref, domainID, i),
-			fmt.Sprintf("%s/%d/device/vif/%d/feature-ipv4-csum-offload",
-				pref, domainID, i),
-			fmt.Sprintf("%s/%d/device/vif/%d/feature-ipv6-csum-offload",
-				pref, domainID, i),
-		}
-		for _, varName := range varNames {
-			cmd := "xenstore"
-			args := []string{
-				"write",
-				varName,
-				"0",
-			}
-			stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
-			if err != nil {
-				log.Errorln("xenstore write failed ", err)
-				log.Errorln("xenstore write output ", string(stdoutStderr))
-				return fmt.Errorf("xenstore write failed: %s\n",
-					string(stdoutStderr))
-			}
-			log.Debugf("xenstore write done. Result %s\n",
-				string(stdoutStderr))
-		}
+	stateMap := map[string]types.SwState{
+		"running": types.RUNNING,
+		"paused":  types.PAUSED,
+		"halting": types.HALTING,
+		"broken":  types.BROKEN,
+	}
+	effectiveDomainState, matched := stateMap[strings.TrimSpace(stdOut)]
+	if !matched {
+		return effectiveDomainID, types.BROKEN, fmt.Errorf("info: domain %s reported to be in unexpected state %s",
+			domainName, stdOut)
 	}
 
-	log.Infof("xlDisableVifOffload done.\n")
-	return nil
+	return effectiveDomainID, effectiveDomainState, nil
 }
 
 func (ctx xenContext) PCIReserve(long string) error {
 	log.Infof("pciAssignableAdd %s\n", long)
-	cmd := "xl"
-	args := []string{
-		"pci-assignable-add",
-		long,
-	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
+	stdOut, stdErr, err := containerd.CtrSystemExec("xen-tools",
+		[]string{"xl", "pci-assignable-add", long})
 	if err != nil {
-		errStr := fmt.Sprintf("xl pci-assignable-add failed: %s\n",
-			string(stdoutStderr))
+		errStr := fmt.Sprintf("xl pci-assignable-add failed: %s %s", stdOut, stdErr)
 		log.Errorln(errStr)
 		return errors.New(errStr)
 	}
@@ -563,16 +469,10 @@ func (ctx xenContext) PCIReserve(long string) error {
 
 func (ctx xenContext) PCIRelease(long string) error {
 	log.Infof("pciAssignableRemove %s\n", long)
-	cmd := "xl"
-	args := []string{
-		"pci-assignable-rem",
-		"-r",
-		long,
-	}
-	stdoutStderr, err := wrap.Command(cmd, args...).CombinedOutput()
+	stdOut, stdErr, err := containerd.CtrSystemExec("xen-tools",
+		[]string{"xl", "pci-assignable-rem", "-r", long})
 	if err != nil {
-		errStr := fmt.Sprintf("xl pci-assignable-rem failed: %s\n",
-			string(stdoutStderr))
+		errStr := fmt.Sprintf("xl pci-assignable-rem failed: %s %s", stdOut, stdErr)
 		log.Errorln(errStr)
 		return errors.New(errStr)
 	}
@@ -580,34 +480,14 @@ func (ctx xenContext) PCIRelease(long string) error {
 	return nil
 }
 
-func (ctx xenContext) IsDeviceModelAlive(domid int) bool {
-	// create pgrep command to see if dataplane is running
-	match := fmt.Sprintf("domid %d", domid)
-	cmd := wrap.Command("pgrep", "-f", match)
-
-	// pgrep returns 0 when there is atleast one matching program running
-	// cmd.Output returns nil when pgrep returns 0, otherwise pids.
-	out, err := cmd.Output()
-
-	if err != nil {
-		log.Infof("IsDeviceModelAlive: %s process is not running: %s",
-			match, err)
-		return false
-	}
-	log.Infof("IsDeviceModelAlive: Instances of %s is running: %s",
-		match, out)
-	return true
-}
-
 func (ctx xenContext) GetHostCPUMem() (types.HostMemory, error) {
-	xlCmd := exec.Command("xl", "info")
-	stdout, err := xlCmd.Output()
+	xlInfo, stderr, err := containerd.CtrSystemExec("xen-tools",
+		[]string{"xl", "info"})
 	if err != nil {
-		log.Errorf("xl info failed %s\n falling back on Dom0 stats", err)
+		log.Errorf("xl info failed %s %s falling back on Dom0 stats: %v", xlInfo, stderr, err)
 		return selfDomCPUMem()
 	}
 
-	xlInfo := string(stdout)
 	splitXlInfo := strings.Split(xlInfo, "\n")
 
 	dict := make(map[string]string, len(splitXlInfo)-1)
@@ -651,8 +531,8 @@ func (ctx xenContext) GetHostCPUMem() (types.HostMemory, error) {
 func (ctx xenContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 	count := 0
 	counter := 0
-	stdout, _, _ := execWithTimeout("xentop", "-b", "-d", "1", "-i", "2", "-f")
-	xentopInfo := string(stdout)
+	xentopInfo, _, _ := containerd.CtrSystemExec("xen-tools",
+		[]string{"xentop", "-b", "-d", "1", "-i", "2", "-f"})
 
 	splitXentopInfo := strings.Split(xentopInfo, "\n")
 	splitXentopInfoLength := len(splitXentopInfo)
@@ -720,11 +600,13 @@ func (ctx xenContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 	}
 	log.Debugf("ExecuteXentopCmd return %+v", cpuMemoryStat)
 
-	var dmList map[string]types.DomainMetric
-	if len(cpuMemoryStat) == 0 {
+	// first we get all the task stats from containerd, and we update
+	// the ones that have a Xen domain associated with them
+	dmList, err := ctx.ctrdContext.GetDomsCPUMem()
+	if len(cpuMemoryStat) != 0 {
+		dmList = parseCPUMemoryStat(cpuMemoryStat, dmList)
+	} else if err != nil {
 		dmList = fallbackDomainMetric()
-	} else {
-		dmList = parseCPUMemoryStat(cpuMemoryStat)
 	}
 	// finally add host entry to dmList
 	if false {
@@ -737,9 +619,12 @@ func (ctx xenContext) GetDomsCPUMem() (map[string]types.DomainMetric, error) {
 }
 
 // Returns cpuTotal, usedMemory, availableMemory, usedPercentage
-func parseCPUMemoryStat(cpuMemoryStat [][]string) map[string]types.DomainMetric {
+func parseCPUMemoryStat(cpuMemoryStat [][]string, dmList map[string]types.DomainMetric) map[string]types.DomainMetric {
+	result := dmList
+	if result == nil {
+		result = make(map[string]types.DomainMetric)
+	}
 
-	result := make(map[string]types.DomainMetric)
 	for _, stat := range cpuMemoryStat {
 		if len(stat) <= 2 {
 			continue
@@ -815,17 +700,4 @@ func fallbackDomainMetric() map[string]types.DomainMetric {
 	}
 	dmList[dom0Name] = dm
 	return dmList
-}
-
-func execWithTimeout(command string, args ...string) ([]byte, bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(),
-		10*time.Second)
-	defer cancel()
-
-	cmd := exec.CommandContext(ctx, command, args...)
-	out, err := cmd.Output()
-	if ctx.Err() == context.DeadlineExceeded {
-		return nil, false, nil
-	}
-	return out, true, err
 }

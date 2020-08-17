@@ -7,13 +7,15 @@ package zedagent
 
 import (
 	"bytes"
-	"github.com/golang/protobuf/ptypes/timestamp"
 	"net"
 	"strings"
 	"time"
 
+	"github.com/golang/protobuf/ptypes/timestamp"
+
 	"github.com/golang/protobuf/proto"
 	"github.com/golang/protobuf/ptypes"
+	zcommon "github.com/lf-edge/eve/api/go/evecommon"
 	"github.com/lf-edge/eve/api/go/flowlog"
 	zinfo "github.com/lf-edge/eve/api/go/info"   // XXX need to stop using
 	zmet "github.com/lf-edge/eve/api/go/metrics" // zinfo and zmet here
@@ -25,25 +27,25 @@ import (
 var flowIteration int
 
 func handleNetworkInstanceModify(ctxArg interface{}, key string, statusArg interface{}) {
-	log.Infof("handleNetworkInstanceStatusModify(%s)\n", key)
+	log.Infof("handleNetworkInstanceStatusModify(%s)", key)
 	ctx := ctxArg.(*zedagentContext)
 	status := statusArg.(types.NetworkInstanceStatus)
 	if !status.ErrorTime.IsZero() {
-		log.Errorf("Received NetworkInstance error %s\n",
+		log.Errorf("Received NetworkInstance error %s",
 			status.Error)
 	}
 	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, false)
-	log.Infof("handleNetworkInstanceModify(%s) done\n", key)
+	log.Infof("handleNetworkInstanceModify(%s) done", key)
 }
 
 func handleNetworkInstanceDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleNetworkInstanceDelete(%s)\n", key)
+	log.Infof("handleNetworkInstanceDelete(%s)", key)
 	status := statusArg.(types.NetworkInstanceStatus)
 	ctx := ctxArg.(*zedagentContext)
 	prepareAndPublishNetworkInstanceInfoMsg(ctx, status, true)
-	log.Infof("handleNetworkInstanceDelete(%s) done\n", key)
+	log.Infof("handleNetworkInstanceDelete(%s) done", key)
 }
 
 func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
@@ -62,6 +64,7 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 	info.NetworkVersion = status.UUIDandVersion.Version
 	info.Displayname = status.DisplayName
 	info.InstType = uint32(status.Type)
+	info.CurrentUplinkIntf = status.CurrentUplinkIntf
 
 	if !status.ErrorTime.IsZero() {
 		errInfo := new(zinfo.ErrorInfo)
@@ -110,7 +113,7 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 				continue
 			}
 			reportAA := new(zinfo.ZioBundle)
-			reportAA.Type = zinfo.IPhyIoType(ia.Type)
+			reportAA.Type = zcommon.PhyIoType(ia.Type)
 			reportAA.Name = ia.Phylabel
 			reportAA.UsedByAppUUID = zcdevUUID.String()
 			list := ctx.assignableAdapters.LookupIoBundleAny(ia.Phylabel)
@@ -148,7 +151,7 @@ func prepareAndPublishNetworkInstanceInfoMsg(ctx *zedagentContext,
 	if x, ok := infoMsg.GetInfoContent().(*zinfo.ZInfoMsg_Niinfo); ok {
 		x.Niinfo = info
 	}
-	log.Debugf("Publish NetworkInstance Info message to zedcloud: %v\n",
+	log.Debugf("Publish NetworkInstance Info message to zedcloud: %v",
 		infoMsg)
 	publishInfo(ctx, uuid, infoMsg)
 }
@@ -259,13 +262,13 @@ func fillVpnInfo(info *zinfo.ZInfoNetworkInstance, vpnStatus *types.VpnStatus) {
 func handleNetworkInstanceMetricsModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Debugf("handleNetworkInstanceMetricsModify(%s)\n", key)
+	log.Debugf("handleNetworkInstanceMetricsModify(%s)", key)
 }
 
 func handleNetworkInstanceMetricsDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleNetworkInstanceMetricsDelete(%s)\n", key)
+	log.Infof("handleNetworkInstanceMetricsDelete(%s)", key)
 }
 
 func createNetworkInstanceMetrics(ctx *zedagentContext, reportMetrics *zmet.ZMetricMsg) {
@@ -295,7 +298,7 @@ func protoEncodeNetworkInstanceMetricProto(status types.NetworkInstanceMetrics) 
 		protoEncodeVpnInstanceMetric(status, metric)
 
 	case types.NetworkInstanceTypeMesh: // XXX any subtype?
-		log.Debugf("Publish Lisp Instance Metric to Zedcloud %v\n",
+		log.Debugf("Publish Lisp Instance Metric to Zedcloud %v",
 			metric)
 		protoEncodeLispInstanceMetric(status, metric)
 	default:
@@ -680,12 +683,12 @@ func publishInfo(ctx *zedagentContext, UUID string, infoMsg *zinfo.ZInfoMsg) {
 
 func publishInfoToZedCloud(UUID string, infoMsg *zinfo.ZInfoMsg, iteration int) {
 
-	log.Infof("publishInfoToZedCloud sending %v\n", infoMsg)
+	log.Infof("publishInfoToZedCloud sending %v", infoMsg)
 	data, err := proto.Marshal(infoMsg)
 	if err != nil {
 		log.Fatal("publishInfoToZedCloud proto marshaling error: ", err)
 	}
-	statusUrl := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, false, devUUID, "info")
+	statusUrl := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "info")
 	zedcloud.RemoveDeferred(UUID)
 	buf := bytes.NewBuffer(data)
 	if buf == nil {
@@ -694,7 +697,7 @@ func publishInfoToZedCloud(UUID string, infoMsg *zinfo.ZInfoMsg, iteration int) 
 	size := int64(proto.Size(infoMsg))
 	err = SendProtobuf(statusUrl, buf, size, iteration)
 	if err != nil {
-		log.Errorf("publishInfoToZedCloud failed: %s\n", err)
+		log.Errorf("publishInfoToZedCloud failed: %s", err)
 		// Try sending later
 		// The buf might have been consumed
 		buf := bytes.NewBuffer(data)
@@ -711,7 +714,7 @@ func publishInfoToZedCloud(UUID string, infoMsg *zinfo.ZInfoMsg, iteration int) 
 func handleAppFlowMonitorModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleAppFlowMonitorModify(%s)\n", key)
+	log.Infof("handleAppFlowMonitorModify(%s)", key)
 	flows := statusArg.(types.IPFlow)
 
 	// encoding the flows with protobuf format
@@ -724,13 +727,13 @@ func handleAppFlowMonitorModify(ctxArg interface{}, key string,
 func handleAppFlowMonitorDelete(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleAppFlowMonitorDelete(%s)\n", key)
+	log.Infof("handleAppFlowMonitorDelete(%s)", key)
 }
 
 func handleAppVifIPTrigModify(ctxArg interface{}, key string,
 	statusArg interface{}) {
 
-	log.Infof("handleAppVifIPTrigModify(%s)\n", key)
+	log.Infof("handleAppVifIPTrigModify(%s)", key)
 	ctx := ctxArg.(*zedagentContext)
 	trig := statusArg.(types.VifIPTrig)
 	findVifAndTrigAppInfoUpload(ctx, trig.MacAddr, trig.IPAddr)
@@ -746,7 +749,7 @@ func findVifAndTrigAppInfoUpload(ctx *zedagentContext, macAddr string, ipAddr ne
 		uuidStr := aiStatus.Key()
 		aiStatusPtr := &aiStatus
 		if aiStatusPtr.MaybeUpdateAppIPAddr(macAddr, ipAddr.String()) {
-			log.Debugf("findVifAndTrigAppInfoUpload: underlay %v", aiStatusPtr.UnderlayNetworks)
+			log.Infof("findVifAndTrigAppInfoUpload: underlay %v", aiStatusPtr.UnderlayNetworks)
 			PublishAppInfoToZedCloud(ctx, uuidStr, aiStatusPtr, ctx.assignableAdapters, ctx.iteration)
 			ctx.iteration++
 			break
@@ -754,11 +757,11 @@ func findVifAndTrigAppInfoUpload(ctx *zedagentContext, macAddr string, ipAddr ne
 	}
 }
 
-func aclActionToProtoAction(action string) flowlog.ACLAction {
+func aclActionToProtoAction(action types.ACLActionType) flowlog.ACLAction {
 	switch action {
-	case "ACCEPT":
+	case types.ACLActionAccept:
 		return flowlog.ACLAction_ActionAccept
-	case "DROP":
+	case types.ACLActionDrop:
 		return flowlog.ACLAction_ActionDrop
 	default:
 		return flowlog.ACLAction_ActionUnknown
@@ -827,32 +830,27 @@ func protoEncodeAppFlowMonitorProto(ipflow types.IPFlow) *flowlog.FlowMessage {
 
 func sendFlowProtobuf(protoflows *flowlog.FlowMessage) {
 
-	flowQ.PushBack(*protoflows)
+	flowQ.PushBack(protoflows)
 
 	for flowQ.Len() > 0 {
 		ent := flowQ.Front()
-		pflows := ent.Value.(flowlog.FlowMessage)
+		pflowsPtr := ent.Value.(*flowlog.FlowMessage)
 
-		data, err := proto.Marshal(&pflows)
+		data, err := proto.Marshal(pflowsPtr)
 		if err != nil {
 			log.Errorf("FlowStats: SendFlowProtobuf proto marshaling error %v", err) // XXX change to fatal
 		}
 
 		flowIteration++
 		buf := bytes.NewBuffer(data)
-		size := int64(proto.Size(&pflows))
-		flowlogURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, false, devUUID, "flowlog")
-		const return400 = false
+		size := int64(proto.Size(pflowsPtr))
+		flowlogURL := zedcloud.URLPathString(serverNameAndPort, zedcloudCtx.V2API, devUUID, "flowlog")
+		const bailOnHTTPErr = false
 		_, _, rtf, err := zedcloud.SendOnAllIntf(&zedcloudCtx, flowlogURL,
-			size, buf, flowIteration, return400)
+			size, buf, flowIteration, bailOnHTTPErr)
 		if err != nil {
-			if rtf == types.SenderStatusRemTempFail {
-				log.Errorf("FlowStats: sendFlowProtobuf  remoteTemporaryFailure: %s",
-					err)
-			} else {
-				log.Errorf("FlowStats: sendFlowProtobuf failed: %s",
-					err)
-			}
+			log.Errorf("FlowStats: sendFlowProtobuf status %d failed: %s",
+				rtf, err)
 			flowIteration--
 			if flowQ.Len() > 100 { // if fail to send for too long, start to drop
 				flowQ.Remove(ent)
@@ -860,7 +858,7 @@ func sendFlowProtobuf(protoflows *flowlog.FlowMessage) {
 			return
 		}
 
-		log.Debugf("Send Flow protobuf out on all intfs, message size %d, flowQ size %d\n",
+		log.Debugf("Send Flow protobuf out on all intfs, message size %d, flowQ size %d",
 			size, flowQ.Len())
 		writeSentFlowProtoMessage(data)
 
@@ -875,4 +873,11 @@ func timeNanoToProto(timenum int64) *timestamp.Timestamp {
 
 func writeSentFlowProtoMessage(contents []byte) {
 	writeProtoMessage("lastflowlog", contents)
+}
+
+func handleAppContainerMetricsModify(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	acMetrics := statusArg.(types.AppContainerMetrics)
+	log.Debugf("handleAppContainerMetricsModify(%s), num containers %d", key, len(acMetrics.StatsList))
 }

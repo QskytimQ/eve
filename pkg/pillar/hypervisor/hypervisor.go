@@ -8,25 +8,14 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/shirou/gopsutil/cpu"
 	"github.com/shirou/gopsutil/mem"
+	log "github.com/sirupsen/logrus"
 	"os"
 )
 
 // Hypervisor provides methods for manipulating domains on the host
 type Hypervisor interface {
 	Name() string
-
-	CreateDomConfig(string, types.DomainConfig, []types.DiskStatus, *types.AssignableAdapters, *os.File) error
-
-	Create(string, string) (int, error)
-
-	Start(string, int) error
-	Tune(string, int, int) error
-	Stop(string, int, bool) error
-	Delete(string, int) error
-	Info(string, int) error
-	LookupByName(string, int) (int, error)
-
-	IsDeviceModelAlive(int) bool
+	Task(*types.DomainStatus) types.Task
 
 	PCIReserve(string) error
 	PCIRelease(string) error
@@ -41,11 +30,15 @@ type hypervisorDesc struct {
 }
 
 var knownHypervisors = map[string]hypervisorDesc{
-	"xen":  {constructor: newXen, dom0handle: "/proc/xen"},
-	"kvm":  {constructor: newKvm, dom0handle: "/dev/kvm"},
-	"acrn": {constructor: newAcrn, dom0handle: "/dev/acrn"},
-	"null": {constructor: newNull, dom0handle: ""},
+	"xen":        {constructor: newXen, dom0handle: "/proc/xen"},
+	"kvm":        {constructor: newKvm, dom0handle: "/dev/kvm"},
+	"acrn":       {constructor: newAcrn, dom0handle: "/dev/acrn"},
+	"containerd": {constructor: newContainerd, dom0handle: "/run/containerd/containerd.sock"},
+	"null":       {constructor: newNull, dom0handle: "/"},
 }
+
+// this is a priority order to pick a default hypervisor if multiple are availabel (more to less likely)
+var hypervisorPriority = []string{"xen", "kvm", "acrn", "containerd", "null"}
 
 // GetHypervisor returns a particular hypervisor implementation
 func GetHypervisor(hint string) (Hypervisor, error) {
@@ -60,14 +53,12 @@ func GetHypervisor(hint string) (Hypervisor, error) {
 // the one that is enabled on the system. Note that you don't have to follow
 // the advice of this function and always ask for the enabled one.
 func GetAvailableHypervisors() (all []string, enabled []string) {
-	for k, v := range knownHypervisors {
-		all = append(all, k)
-		if _, err := os.Stat(v.dom0handle); err == nil {
-			enabled = append(enabled, k)
+	all = hypervisorPriority
+	for _, v := range all {
+		if _, err := os.Stat(knownHypervisors[v].dom0handle); err == nil {
+			enabled = append(enabled, v)
 		}
 	}
-	// null is always enabled for now
-	enabled = append(enabled, "null")
 	return
 }
 
@@ -99,4 +90,9 @@ func roundFromKbytesToMbytes(byteCount uint64) uint64 {
 	const kbyte = 1024
 
 	return (byteCount + kbyte/2) / kbyte
+}
+
+func logError(format string, a ...interface{}) error {
+	log.Errorf(format, a...)
+	return fmt.Errorf(format, a...)
 }

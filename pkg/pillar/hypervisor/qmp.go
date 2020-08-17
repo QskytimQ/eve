@@ -3,6 +3,8 @@ package hypervisor
 import (
 	"encoding/json"
 	"github.com/digitalocean/go-qemu/qmp"
+	log "github.com/sirupsen/logrus"
+	"os"
 	"time"
 )
 
@@ -45,11 +47,6 @@ func execQuit(socket string) error {
 	return err
 }
 
-func execQueryCLIOptions(socket string) (string, error) {
-	res, err := execRawCmd(socket, `{ "execute": "query-command-line-options" }`)
-	return string(res), err
-}
-
 func getQemuStatus(socket string) (string, error) {
 	if raw, err := execRawCmd(socket, `{ "execute": "query-status" }`); err == nil {
 		var result struct {
@@ -64,5 +61,46 @@ func getQemuStatus(socket string) (string, error) {
 		return result.Return.Status, err
 	} else {
 		return "", err
+	}
+}
+
+func qmpEventHandler(listenerSocket, executorSocket string) {
+	monitor, err := qmp.NewSocketMonitor("unix", listenerSocket, sockTimeout)
+	if err != nil {
+		log.Errorf("qmpEventHandler: Exception while getting monitor of listenerSocket: %s. %s", listenerSocket, err.Error())
+		return
+	}
+	if err := monitor.Connect(); err != nil {
+		log.Errorf("qmpEventHandler: Exception while connecting listenerSocket: %s. %s", listenerSocket, err.Error())
+		return
+	}
+	defer monitor.Disconnect()
+
+	eventChan, err := monitor.Events()
+	if err != nil {
+		log.Errorf("qmpEventHandler: Exception while getting event channel from listenerSocket: %s. %s", listenerSocket, err.Error())
+		return
+	}
+	for {
+		if _, err := os.Stat(listenerSocket); err != nil {
+			log.Errorf("qmpEventHandler: Exception while accessing listenerSocket: %s. %s", listenerSocket, err.Error())
+			return
+		}
+		select {
+		case event := <-eventChan:
+			switch event.Event {
+			case "SHUTDOWN":
+				log.Infof("qmpEventHandler: Received event: %s event details: %v. Calling quit on socket: %s", event.Event, event.Data, executorSocket)
+				if err := execStop(executorSocket); err != nil {
+					log.Errorf("qmpEventHandler: Exception while stopping domain with socket: %s. %s", executorSocket, err.Error())
+				}
+				if err := execQuit(executorSocket); err != nil {
+					log.Errorf("qmpEventHandler: Exception while quitting domain with socket: %s. %s", executorSocket, err.Error())
+				}
+			default:
+				//Not handling the following events: RESUME, NIC_RX_FILTER_CHANGED, RTC_CHANGE, POWERDOWN, STOP
+				log.Debugf("qmpEventHandler: Unhandled event: %s from listenerSocket: %s", event.Event, listenerSocket)
+			}
+		}
 	}
 }

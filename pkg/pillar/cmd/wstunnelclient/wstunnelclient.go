@@ -18,6 +18,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
+	"github.com/satori/go.uuid"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -46,6 +47,7 @@ type wstunnelclientContext struct {
 	serverNameAndPort    string
 	wstunnelclient       *zedcloud.WSTunnelClient
 	dnsContext           *DNSContext
+	devUUID              uuid.UUID
 	// XXX add any output from scanAIConfigs()?
 }
 
@@ -55,7 +57,6 @@ var debugOverride bool // From command line arg
 func Run(ps *pubsub.PubSub) {
 	versionPtr := flag.Bool("v", false, "Version")
 	debugPtr := flag.Bool("d", false, "Debug flag")
-	curpartPtr := flag.String("c", "", "Current partition")
 	flag.Parse()
 	debug = *debugPtr
 	debugOverride = debug
@@ -64,15 +65,11 @@ func Run(ps *pubsub.PubSub) {
 	} else {
 		log.SetLevel(log.InfoLevel)
 	}
-	curpart := *curpartPtr
 	if *versionPtr {
 		fmt.Printf("%s: %s\n", os.Args[0], Version)
 		return
 	}
-	err := agentlog.Init(agentName, curpart)
-	if err != nil {
-		log.Fatal(err)
-	}
+	agentlog.Init(agentName)
 	if err := pidfile.CheckAndCreatePidfile(agentName); err != nil {
 		log.Fatal(err)
 	}
@@ -92,7 +89,7 @@ func Run(ps *pubsub.PubSub) {
 	// Look for global config such as log levels
 	subGlobalConfig, err := ps.NewSubscription(pubsub.SubscriptionOptions{
 		AgentName:     "",
-		TopicImpl:     types.GlobalConfig{},
+		TopicImpl:     types.ConfigItemValueMap{},
 		Activate:      false,
 		Ctx:           &wscCtx,
 		CreateHandler: handleGlobalConfigModify,
@@ -151,6 +148,19 @@ func Run(ps *pubsub.PubSub) {
 
 	subAppInstanceConfig.Activate()
 
+	if zedcloud.UseV2API() {
+		b, err := ioutil.ReadFile(types.UUIDFileName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		uuidStr := strings.TrimSpace(string(b))
+		wscCtx.devUUID, err = uuid.FromString(uuidStr)
+		if err != nil {
+			log.Fatal(err)
+		}
+		log.Infof("Read devUUID %s\n", wscCtx.devUUID.String())
+	}
+
 	// Pick up debug aka log level before we start real work
 	for !wscCtx.GCInitialized {
 		log.Infof("waiting for GCInitialized")
@@ -203,7 +213,7 @@ func handleGlobalConfigModify(ctxArg interface{}, key string,
 		return
 	}
 	log.Infof("handleGlobalConfigModify for %s\n", key)
-	var gcp *types.GlobalConfig
+	var gcp *types.ConfigItemValueMap
 	debug, gcp = agentlog.HandleGlobalConfig(ctx.subGlobalConfig, agentName,
 		debugOverride)
 	if gcp != nil {
@@ -351,7 +361,7 @@ func scanAIConfigs(ctx *wstunnelclientContext) {
 
 			proxyURL, _ := zedcloud.LookupProxy(deviceNetworkStatus,
 				ifname, destURL)
-			if err := wstunnelclient.TestConnection(deviceNetworkStatus, proxyURL, localAddr); err != nil {
+			if err := wstunnelclient.TestConnection(deviceNetworkStatus, proxyURL, localAddr, ctx.devUUID); err != nil {
 				log.Info(err)
 				continue
 			}
